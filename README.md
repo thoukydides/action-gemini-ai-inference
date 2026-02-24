@@ -42,6 +42,9 @@ Various inputs are defined in the action to configure its operation:
 | `file_input` | Template variables in YAML where values are file paths | `""`
 | `max_tokens` | The maximum number of tokens to generate (includes dynamic thinking and thought summary) | `65536`
 | `max_retries` | The maximum number of attempts to obtain a valid inference result | `5`
+| `max_elapsed_minutes` | The maximum elapsed time to obtain a valid inference result | `45`
+
+Only successful API requests are counted against the `max_retries` limit. Retryable HTTP errors preserve the retry counter, but are constrained by `max_elapsed_minutes`.
 
 ## Outputs
 
