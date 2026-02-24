@@ -64516,6 +64516,8 @@ function plural(count, noun, showCount = true) {
 }
 // Format a milliseconds duration
 function formatMilliseconds(ms, maxParts = 2) {
+    if (ms < 1)
+        return 'n/a';
     // Split the duration into components
     const duration = [
         ['day', Math.floor(ms / (24 * 60 * 60 * MS))],
@@ -64541,11 +64543,15 @@ class RetryableError extends Error {
 }
 const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
 // Delay before retrying
-const RETRY_DELAY_MS = 60_000; // 1 minute (to avoid RPM and TPM limits)
+const MIN_RETRY_DELAY_MS = 1 * 60_000; // 1 minute (for RPM and TPM limits)
+const MIN_RETRY_JITTER_MS = 10_000; // Start with 10 seconds of random jitter
+const MAX_RETRY_JITTER_MS = 5 * 60_000; // Cap jitter at 5 minutes
+const RETRY_JITTER_FACTOR = 1.5; // Exponential backoff factor for jitter
 // Perform an inference request
-async function geminiInference(apiKey, params, maxRetries) {
-    let attempt = 1;
-    for (;;) {
+async function geminiInference(apiKey, params, maxRetries, maxElapsedMinutes) {
+    const startTime = Date.now();
+    let retryCount = 0;
+    for (let attempt = 1;; attempt++) {
         try {
             // Attempt inference and return if successful
             const result = await attemptInference(apiKey, params);
@@ -64553,18 +64559,35 @@ async function geminiInference(apiKey, params, maxRetries) {
             return result;
         }
         catch (err) {
-            // Handle non-retryable errors or after exhausting retries
+            // Check whether the error is retryable
             const message = err instanceof Error ? err.message : String(err);
-            if (!isRetryableError(err)) {
+            let retryDelay = MIN_RETRY_DELAY_MS;
+            if (err instanceof RetryableError) {
+                // Retryable model response error; try again after minimum delay
+                ++retryCount;
+            }
+            else if (err instanceof ApiError && RETRYABLE_STATUS_CODES.includes(err.status)) {
+                // HTTP error with retryable status code; add exponentially increasing jitter
+                const jitterMultiplier = Math.pow(RETRY_JITTER_FACTOR, attempt - 1);
+                const jitterWindow = Math.min(MIN_RETRY_JITTER_MS * jitterMultiplier, MAX_RETRY_JITTER_MS);
+                retryDelay += Math.floor(Math.random() * jitterWindow);
+                // (retryCount not increased for HTTP errors)
+            }
+            else {
+                // Non-retryable error
                 throw new Error(`Inference failed with non-retryable error: ${message}`);
             }
-            else if (maxRetries <= attempt) {
-                throw new Error(`Inference failed after ${plural(attempt, 'attempts')}: ${message}`);
+            // Check whether the retry limits have been exceeded
+            if (maxRetries <= retryCount) {
+                throw new Error(`Inference failed after ${plural(retryCount, 'retry')}: ${message}`);
+            }
+            else if (startTime + maxElapsedMinutes * 60_000 < Date.now() + retryDelay) {
+                throw new Error(`Inference failed after ${formatMilliseconds(Date.now() - startTime)} elapsed: ${message}`);
             }
             // Log the retryable error and retry after a delay
-            coreExports.info(`Inference failed: ${message}`);
-            coreExports.info(`Trying again in ${formatMilliseconds(RETRY_DELAY_MS)} (attempt #${++attempt} of ${maxRetries})...`);
-            await promises.setTimeout(RETRY_DELAY_MS);
+            coreExports.info(`Inference attempt #${attempt} failed: ${message}`);
+            coreExports.info(`Trying again in ${formatMilliseconds(retryDelay)} (${retryCount} of ${plural(maxRetries, 'retry')})...`);
+            await promises.setTimeout(retryDelay);
         }
     }
 }
@@ -64606,11 +64629,6 @@ async function attemptInference(apiKey, params) {
     }
     // Return the text response
     return { response, thoughts };
-}
-// Check whether an error is retryable
-function isRetryableError(err) {
-    return err instanceof RetryableError
-        || (err instanceof ApiError && RETRYABLE_STATUS_CODES.includes(err.status));
 }
 
 // GitHub action
@@ -64681,6 +64699,7 @@ async function run() {
     const file_input = coreExports.getInput('file_input', { required: false });
     const max_tokens = Number(coreExports.getInput('max_tokens', { required: true }));
     const max_retries = Number(coreExports.getInput('max_retries', { required: true }));
+    const max_elapsed_minutes = Number(coreExports.getInput('max_elapsed_minutes', { required: true }));
     // Load the prompt file
     const prompt = loadPromptFile(prompt_file);
     // Substitute template variables in the prompt messages
@@ -64694,7 +64713,7 @@ async function run() {
     coreExports.info(JSON.stringify(params, null, 4));
     coreExports.endGroup();
     // Perform the inference
-    const { response, thoughts } = await geminiInference(gemini_api_key, params, max_retries);
+    const { response, thoughts } = await geminiInference(gemini_api_key, params, max_retries, max_elapsed_minutes);
     // Log the response
     coreExports.startGroup('Inference response');
     if (thoughts)

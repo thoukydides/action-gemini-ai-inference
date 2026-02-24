@@ -30,6 +30,10 @@ inputs:
     description: The maximum number of attempts to obtain a valid inference result
     type: number
     default: 5
+  max_elapsed_minutes:
+    description: The maximum elapsed time to obtain a valid inference result
+    type: number
+    default: 45
 
 outputs:
   response:
