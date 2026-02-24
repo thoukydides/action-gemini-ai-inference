@@ -44680,13 +44680,13 @@ var z = /*#__PURE__*/Object.freeze({
 // GitHub action
 // Copyright © 2026 Alexander Thoukydides
 // Prompt file format
-const makeMessageSchema = (role) => z.object({
+const makeMessageSchema = (role) => z.strictObject({
     role: z.literal(role),
     content: z.string()
 });
 const SystemMessageSchema = makeMessageSchema('system');
 const UserMessageSchema = makeMessageSchema('user');
-const BasePromptSchema = z.object({
+const BasePromptSchema = z.strictObject({
     model: z.string(),
     thinkingLevel: z.optional(z.enum(['minimal', 'low', 'medium', 'high'])),
     messages: z.union([
@@ -44696,7 +44696,7 @@ const BasePromptSchema = z.object({
 });
 const PromptSchema = z.union([
     BasePromptSchema,
-    BasePromptSchema.extend({
+    BasePromptSchema.safeExtend({
         responseFormat: z.literal('json_schema'),
         jsonSchema: z.string()
     })
