@@ -1,0 +1,44 @@
+name: Gemini AI Inference
+author: Alexander Thoukydides
+description: Inference using Google AI Studio Gemini models
+branding:
+  icon: 'cloud'
+  color: 'blue'
+
+inputs:
+  gemini_api_key:
+    description: The Google AI Studio Gemini API key
+    type: string
+    required: true
+  prompt_file:
+    description: Path to a file containing the YAML format prompt
+    type: string
+    required: true
+  input:
+    description: Template variables in YAML format
+    type: string
+    default: ""
+  file_input:
+    description: Template variables in YAML where values are file paths
+    type: string
+    default: ""
+  max_tokens:
+    description: The maximum number of tokens to generate (includes dynamic thinking and thought summary)
+    type: number
+    default: 65536
+  max_retries:
+    description: The maximum number of attempts to obtain a valid inference result
+    type: number
+    default: 5
+
+outputs:
+  response:
+    description: The response from the model
+  response_file:
+    description: The file path where the response is saved
+  thoughts:
+    description: Any thought summaries returned by the model
+
+runs:
+  using: node20
+  main: dist/index.js

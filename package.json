@@ -1,0 +1,83 @@
+{
+    "name": "action-gemini-ai-inference",
+    "version": "1.0.0",
+    "description": "GitHub workflow action for calling Google AI Studio Gemini models",
+    "keywords": [
+        "GitHub",
+        "action",
+        "workflow",
+        "AI",
+        "LLM",
+        "inference",
+        "context",
+        "Google",
+        "Gemini",
+        "AI Studio"
+    ],
+    "author": {
+        "name": "Alexander Thoukydides",
+        "url": "https://www.thouky.co.uk/"
+    },
+    "funding": [
+        {
+            "type": "github",
+            "url": "https://github.com/sponsors/thoukydides"
+        },
+        {
+            "type": "paypal",
+            "url": "https://paypal.me/thoukydides"
+        },
+        {
+            "type": "ko-fi",
+            "url": "https://ko-fi.com/thouky"
+        },
+        {
+            "type": "buymeacoffee",
+            "url": "https://www.buymeacoffee.com/thouky"
+        }
+    ],
+    "homepage": "https://github.com/thoukydides/action-releases-context#readme",
+    "bugs": {
+        "url": "https://github.com/thoukydides/action-releases-context/issues"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/thoukydides/action-releases-context.git"
+    },
+    "license": "ISC",
+    "type": "commonjs",
+    "devDependencies": {
+        "@actions/core": "^2.0.2",
+        "@actions/github": "^7.0.0",
+        "@eslint/eslintrc": "^3.3.3",
+        "@eslint/js": "^9.39.2",
+        "@google/genai": "^1.42.0",
+        "@rollup/plugin-commonjs": "^29.0.0",
+        "@rollup/plugin-node-resolve": "^16.0.3",
+        "@rollup/plugin-typescript": "^12.3.0",
+        "@tsconfig/node20": "^20.1.8",
+        "@types/js-yaml": "^4.0.9",
+        "@types/node": "^20.19.29",
+        "@types/semver": "^7.7.1",
+        "@types/turndown": "^5.0.6",
+        "eslint": "^9.39.2",
+        "globals": "^17.0.0",
+        "husky": "^9.1.7",
+        "js-yaml": "^4.1.1",
+        "rimraf": "^6.1.2",
+        "rollup": "^4.55.1",
+        "semver": "^7.7.3",
+        "tslib": "^2.8.1",
+        "turndown": "^7.2.2",
+        "typescript": "^5.9.3",
+        "typescript-eslint": "^8.53.0",
+        "zod": "^4.3.6"
+    },
+    "scripts": {
+        "build": "npm run clean && npm run lint && npm run rollup",
+        "clean": "rimraf ./dist",
+        "rollup": "rollup --config rollup.config.ts --configPlugin @rollup/plugin-typescript --bundleConfigAsCjs",
+        "lint": "eslint eslint.config.mjs 'src/**/*.ts' --max-warnings=0",
+        "prepare": "husky"
+    }
+}

@@ -1,0 +1,30 @@
+{
+    "files.eol": "\n",
+    "editor.codeActionsOnSave": {
+        "source.fixAll.eslint": "explicit"
+    },
+    "editor.rulers": [
+        80
+    ],
+    "eslint.enable": true,
+    "cSpell.words": [
+        "aeiou",
+        "basehead",
+        "buymeacoffee",
+        "color",
+        "dimsuv",
+        "genai",
+        "homeconnect",
+        "JSYAML",
+        "onwarn",
+        "parsable",
+        "rcompare",
+        "semvers",
+        "Thoukydides",
+        "Vars"
+    ],
+    "files.exclude": {
+        "node_modules/": true
+    },
+    "typescript.tsdk": "node_modules/typescript/lib"
+}
