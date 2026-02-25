@@ -47,7 +47,8 @@ export async function geminiInference(
             if (err instanceof RetryableError) {
                 // Retryable model response error; try again after minimum delay
                 ++retryCount;
-            } else if (err instanceof ApiError && RETRYABLE_STATUS_CODES.includes(err.status)) {
+            } else if (err instanceof ApiError && RETRYABLE_STATUS_CODES.includes(err.status)
+                || err instanceof TypeError && err.message === 'fetch failed') {
                 // HTTP error with retryable status code; add exponentially increasing jitter
                 const jitterMultiplier = Math.pow(RETRY_JITTER_FACTOR, attempt - 1);
                 const jitterWindow = Math.min(MIN_RETRY_JITTER_MS * jitterMultiplier, MAX_RETRY_JITTER_MS);
