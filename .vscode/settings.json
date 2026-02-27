@@ -9,6 +9,7 @@
     "eslint.enable": true,
     "cSpell.words": [
         "aeiou",
+        "apierror",
         "basehead",
         "buymeacoffee",
         "color",
@@ -21,6 +22,7 @@
         "rcompare",
         "semvers",
         "Thoukydides",
+        "unparsable",
         "Vars"
     ],
     "files.exclude": {

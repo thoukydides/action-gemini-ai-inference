@@ -64538,10 +64538,158 @@ function formatMilliseconds(ms, maxParts = 2) {
 
 // GitHub action
 // Copyright © 2026 Alexander Thoukydides
+// https://github.com/googleapis/googleapis/blob/master/google/rpc/code.proto
+const GeminiStatusSchema = _enum([
+    'OK',
+    'CANCELLED',
+    'UNKNOWN',
+    'INVALID_ARGUMENT',
+    'DEADLINE_EXCEEDED',
+    'NOT_FOUND',
+    'ALREADY_EXISTS',
+    'PERMISSION_DENIED',
+    'UNAUTHENTICATED',
+    'RESOURCE_EXHAUSTED',
+    'FAILED_PRECONDITION',
+    'ABORTED',
+    'OUT_OF_RANGE',
+    'UNIMPLEMENTED',
+    'INTERNAL',
+    'UNAVAILABLE',
+    'DATA_LOSS'
+]);
+// https://github.com/googleapis/googleapis/blob/master/google/rpc/error_details.proto
+const GoogleApiErrorInfoSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.ErrorInfo'),
+    reason: string$1().optional(),
+    domain: string$1().optional(),
+    metadata: record(string$1(), string$1()).optional()
+});
+const GoogleApiRetryInfoSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.RetryInfo'),
+    retryDelay: string$1()
+});
+const GoogleApiDebugInfoSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.DebugInfo'),
+    stackEntries: array(string$1()).optional(),
+    detail: string$1().optional()
+});
+const GoogleApiQuotaFailureSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.QuotaFailure'),
+    violations: array(object({
+        subject: string$1().optional(),
+        description: string$1().optional(),
+        apiService: string$1().optional(),
+        quotaMetric: string$1(),
+        quotaId: string$1(),
+        quotaDimensions: record(string$1(), string$1()),
+        quotaValue: string$1().optional(),
+        futureQuotaValue: string$1().optional()
+    }))
+});
+const GoogleApiPreconditionFailureSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.PreconditionFailure'),
+    violations: array(object({
+        type: string$1(),
+        subject: string$1(),
+        description: string$1()
+    }))
+});
+const GoogleApiBadRequestSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.BadRequest'),
+    fieldViolations: array(object({
+        field: string$1(),
+        description: string$1(),
+        reason: string$1(),
+        localizedMessage: string$1()
+    }))
+});
+const GoogleApiRequestInfoSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.RequestInfo'),
+    requestId: string$1(),
+    servingData: string$1()
+});
+const GoogleApiResourceInfoSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.ResourceInfo'),
+    resourceType: string$1(),
+    resourceName: string$1(),
+    owner: string$1(),
+    description: string$1()
+});
+const GoogleApiHelpSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.Help'),
+    links: array(object({
+        description: string$1(),
+        url: string$1()
+    }))
+});
+const GoogleApiLocalizedMessageSchema = object({
+    '@type': literal('type.googleapis.com/google.rpc.LocalizedMessage'),
+    locale: string$1(),
+    message: string$1()
+});
+const GoogleApiDetailUnionSchema = discriminatedUnion('@type', [
+    GoogleApiErrorInfoSchema,
+    GoogleApiRetryInfoSchema,
+    GoogleApiDebugInfoSchema,
+    GoogleApiQuotaFailureSchema,
+    GoogleApiPreconditionFailureSchema,
+    GoogleApiBadRequestSchema,
+    GoogleApiRequestInfoSchema,
+    GoogleApiResourceInfoSchema,
+    GoogleApiHelpSchema,
+    GoogleApiLocalizedMessageSchema
+]);
+// Schema for a Google AI Studio ApiError, with loosely typed details
+// https://google.aip.dev/193
+const GoogleApiErrorSchema = object({
+    error: object({
+        code: number$1(),
+        message: string$1(),
+        status: GeminiStatusSchema,
+        details: array(looseObject({ '@type': string$1() })).optional()
+    })
+});
+// Parse a Google API error
+function parseApiError(error) {
+    const json = JSON.parse(error.message);
+    return GoogleApiErrorSchema.parse(json);
+}
+// Find any matching detail(s) from a Google API error
+function findApiErrorDetails(error, type) {
+    const parsedError = parseApiError(error);
+    const filteredDetails = parsedError.error.details?.filter(detail => detail['@type'] === type) ?? [];
+    return filteredDetails.map(detail => GoogleApiDetailUnionSchema.parse(detail));
+}
+// Attempt to extract retry-after for a 429 error
+function getRetryAfterSeconds(error) {
+    try {
+        // Check that the error type matches
+        const { status } = parseApiError(error).error;
+        if (status !== 'RESOURCE_EXHAUSTED')
+            throw new Error(`Unexpected status: ${status}`);
+        // Attempt to extract the retry delay from the details
+        const retryInfo = findApiErrorDetails(error, 'type.googleapis.com/google.rpc.RetryInfo');
+        const retryDelay = retryInfo[0]?.retryDelay;
+        if (!retryDelay)
+            throw new Error('Missing retryDelay');
+        const match = /^(\d+(?:\.\d+)?)s$/.exec(retryDelay);
+        if (!match)
+            throw new Error(`Unexpected retryDelay format: ${retryDelay}`);
+        return Number(match[1]);
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        coreExports.warning(message, { title: 'Failed to parse Google ApiError retry delay' });
+    }
+}
+
+// GitHub action
+// Copyright © 2026 Alexander Thoukydides
 // Retryable errors
 class RetryableError extends Error {
 }
-const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
+const RETRYABLE_STATUS_CODES = [429, 500, 503, 504];
 // Delay before retrying
 const MIN_RETRY_DELAY_MS = 1 * 60_000; // 1 minute (for RPM and TPM limits)
 const MIN_RETRY_JITTER_MS = 10_000; // Start with 10 seconds of random jitter
@@ -64565,6 +64713,12 @@ async function geminiInference(apiKey, params, maxRetries, maxElapsedMinutes) {
             if (err instanceof RetryableError) {
                 // Retryable model response error; try again after minimum delay
                 ++retryCount;
+            }
+            else if (err instanceof ApiError && err.status === 429) {
+                // Too many requests; try after delay specified in error
+                const retryAfter = getRetryAfterSeconds(err);
+                if (retryAfter)
+                    retryDelay = (retryAfter + 1) * 1000;
             }
             else if (err instanceof ApiError && RETRYABLE_STATUS_CODES.includes(err.status)
                 || err instanceof TypeError && err.message === 'fetch failed') {
