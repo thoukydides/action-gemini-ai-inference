@@ -64661,22 +64661,41 @@ function findApiErrorDetails(error, type) {
     const filteredDetails = parsedError.error.details?.filter(detail => detail['@type'] === type) ?? [];
     return filteredDetails.map(detail => GoogleApiDetailUnionSchema.parse(detail));
 }
+// Has a daily usage quota been exceeded
+function getDailyQuotaExceeded(error) {
+    try {
+        const quotaFailure = findApiErrorDetails(error, 'type.googleapis.com/google.rpc.QuotaFailure');
+        if (quotaFailure[0]?.violations.some(v => v.quotaId.includes('PerDay')))
+            return true;
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        coreExports.warning(message, { title: 'Failed to parse Google ApiError QuotaFailure' });
+    }
+    return false;
+}
 // Attempt to extract retry-after for a 429 error
 function getRetryAfterSeconds(error) {
     try {
+        const { message, status } = parseApiError(error).error;
         // Check that the error type matches
-        const { status } = parseApiError(error).error;
         if (status !== 'RESOURCE_EXHAUSTED')
             throw new Error(`Unexpected status: ${status}`);
+        // Attempt to extract the retry delay from the message
+        const RETRY_DELAY_RE = /\b(\d+(?:\.\d+)?)s\b/;
+        const messageMatch = RETRY_DELAY_RE.exec(message);
+        if (messageMatch)
+            return Number(messageMatch[1]);
         // Attempt to extract the retry delay from the details
         const retryInfo = findApiErrorDetails(error, 'type.googleapis.com/google.rpc.RetryInfo');
         const retryDelay = retryInfo[0]?.retryDelay;
         if (!retryDelay)
             throw new Error('Missing retryDelay');
-        const match = /^(\d+(?:\.\d+)?)s$/.exec(retryDelay);
-        if (!match)
-            throw new Error(`Unexpected retryDelay format: ${retryDelay}`);
-        return Number(match[1]);
+        const infoMatch = RETRY_DELAY_RE.exec(retryDelay);
+        if (infoMatch)
+            return Number(infoMatch[1]) + 1; // (extra second due to rounding down)
+        // Failed to extract any retry delay
+        throw new Error(`Unexpected retryDelay format: ${retryDelay}`);
     }
     catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -64689,7 +64708,8 @@ function getRetryAfterSeconds(error) {
 // Retryable errors
 class RetryableError extends Error {
 }
-const RETRYABLE_STATUS_CODES = [429, 500, 503, 504];
+const RETRYABLE_STATUS_CODE_RATE_LIMIT = 429;
+const RETRYABLE_STATUS_CODES_OTHER = [500, 503, 504];
 // Delay before retrying
 const MIN_RETRY_DELAY_MS = 1 * 60_000; // 1 minute (for RPM and TPM limits)
 const MIN_RETRY_JITTER_MS = 10_000; // Start with 10 seconds of random jitter
@@ -64714,13 +64734,14 @@ async function geminiInference(apiKey, params, maxRetries, maxElapsedMinutes) {
                 // Retryable model response error; try again after minimum delay
                 ++retryCount;
             }
-            else if (err instanceof ApiError && err.status === 429) {
+            else if (err instanceof ApiError && err.status === RETRYABLE_STATUS_CODE_RATE_LIMIT
+                && !getDailyQuotaExceeded(err)) {
                 // Too many requests; try after delay specified in error
                 const retryAfter = getRetryAfterSeconds(err);
                 if (retryAfter)
-                    retryDelay = (retryAfter + 1) * 1000;
+                    retryDelay = retryAfter * 1000;
             }
-            else if (err instanceof ApiError && RETRYABLE_STATUS_CODES.includes(err.status)
+            else if (err instanceof ApiError && RETRYABLE_STATUS_CODES_OTHER.includes(err.status)
                 || err instanceof TypeError && err.message === 'fetch failed') {
                 // HTTP error with retryable status code; add exponentially increasing jitter
                 const jitterMultiplier = Math.pow(RETRY_JITTER_FACTOR, attempt - 1);

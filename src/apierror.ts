@@ -140,20 +140,57 @@ export function findApiErrorDetails<T extends GoogleApiDetailType>(error: ApiErr
     return filteredDetails.map(detail => GoogleApiDetailUnionSchema.parse(detail) as GoogleApiDetail<T>);
 }
 
+export function isRetryableRateLimit(error: ApiError): boolean {
+    try {
+        if (error.status !== 429) return false;
+        const { status } = parseApiError(error).error;
+        if (status !== 'RESOURCE_EXHAUSTED') return false;
+
+
+        return true;
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        core.warning(message, { title: 'Failed to parse Google ApiError rate limit' });
+    }
+
+    // Do not retry other errors
+    return false;
+}
+
+// Has a daily usage quota been exceeded
+export function getDailyQuotaExceeded(error: ApiError): boolean {
+    try {
+        const quotaFailure = findApiErrorDetails(error, 'type.googleapis.com/google.rpc.QuotaFailure');
+        if (quotaFailure[0]?.violations.some(v => v.quotaId.includes('PerDay'))) return true;
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        core.warning(message, { title: 'Failed to parse Google ApiError QuotaFailure' });
+    }
+    return false;
+}
+
 // Attempt to extract retry-after for a 429 error
 export function getRetryAfterSeconds(error: ApiError): number | undefined {
     try {
+        const { message, status } = parseApiError(error).error;
+
         // Check that the error type matches
-        const { status } = parseApiError(error).error;
         if (status !== 'RESOURCE_EXHAUSTED') throw new Error(`Unexpected status: ${status}`);
+
+        // Attempt to extract the retry delay from the message
+        const RETRY_DELAY_RE = /\b(\d+(?:\.\d+)?)s\b/;
+        const messageMatch = RETRY_DELAY_RE.exec(message);
+        if (messageMatch) return Number(messageMatch[1]);
 
         // Attempt to extract the retry delay from the details
         const retryInfo = findApiErrorDetails(error, 'type.googleapis.com/google.rpc.RetryInfo');
         const retryDelay = retryInfo[0]?.retryDelay;
         if (!retryDelay) throw new Error('Missing retryDelay');
-        const match = /^(\d+(?:\.\d+)?)s$/.exec(retryDelay);
-        if (!match) throw new Error(`Unexpected retryDelay format: ${retryDelay}`);
-        return Number(match[1]);
+        const infoMatch = RETRY_DELAY_RE.exec(retryDelay);
+        if (infoMatch) return Number(infoMatch[1]) + 1; // (extra second due to rounding down)
+
+        // Failed to extract any retry delay
+        throw new Error(`Unexpected retryDelay format: ${retryDelay}`);
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         core.warning(message, { title: 'Failed to parse Google ApiError retry delay' });

@@ -7,7 +7,7 @@ import z from 'zod';
 import { JSONSchema } from 'zod/v4/core';
 import { setTimeout } from 'node:timers/promises';
 import { formatMilliseconds, plural } from './utils';
-import { getRetryAfterSeconds } from './apierror';
+import { getDailyQuotaExceeded, getRetryAfterSeconds } from './apierror';
 
 // Inference response
 export interface InferenceResponse {
@@ -17,7 +17,8 @@ export interface InferenceResponse {
 
 // Retryable errors
 class RetryableError extends Error {}
-const RETRYABLE_STATUS_CODES = [429, 500, 503, 504];
+const RETRYABLE_STATUS_CODE_RATE_LIMIT = 429;
+const RETRYABLE_STATUS_CODES_OTHER = [500, 503, 504];
 
 // Delay before retrying
 const MIN_RETRY_DELAY_MS    = 1 * 60_000;   // 1 minute (for RPM and TPM limits)
@@ -48,11 +49,12 @@ export async function geminiInference(
             if (err instanceof RetryableError) {
                 // Retryable model response error; try again after minimum delay
                 ++retryCount;
-            } else if (err instanceof ApiError && err.status === 429) {
+            } else if (err instanceof ApiError && err.status === RETRYABLE_STATUS_CODE_RATE_LIMIT
+                && !getDailyQuotaExceeded(err)) {
                 // Too many requests; try after delay specified in error
                 const retryAfter = getRetryAfterSeconds(err);
-                if (retryAfter) retryDelay = (retryAfter + 1) * 1000;
-            } else if (err instanceof ApiError && RETRYABLE_STATUS_CODES.includes(err.status)
+                if (retryAfter) retryDelay = retryAfter * 1000;
+            } else if (err instanceof ApiError && RETRYABLE_STATUS_CODES_OTHER.includes(err.status)
                 || err instanceof TypeError && err.message === 'fetch failed') {
                 // HTTP error with retryable status code; add exponentially increasing jitter
                 const jitterMultiplier = Math.pow(RETRY_JITTER_FACTOR, attempt - 1);
