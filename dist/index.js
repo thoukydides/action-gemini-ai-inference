@@ -64650,44 +64650,57 @@ const GoogleApiErrorSchema = object({
         details: array(looseObject({ '@type': string$1() })).optional()
     })
 });
-// Parse a Google API error
-function parseApiError(error) {
-    const json = JSON.parse(error.message);
-    return GoogleApiErrorSchema.parse(json);
+// Parse a Google API error (returning undefined if code/status do not match)
+function parseApiError(err, code, status) {
+    // Only attempt to parse ApiError messages with matching HTTP status code
+    if (!(err instanceof ApiError))
+        return;
+    if (err.status !== code)
+        return;
+    // Attempt to parse and validate the error message as JSON
+    const json = JSON.parse(err.message);
+    const parsedError = GoogleApiErrorSchema.parse(json);
+    // Return the parsed error if the status code matches
+    if (parsedError.error.status !== status)
+        return;
+    return parsedError;
 }
 // Find any matching detail(s) from a Google API error
-function findApiErrorDetails(error, type) {
-    const parsedError = parseApiError(error);
-    const filteredDetails = parsedError.error.details?.filter(detail => detail['@type'] === type) ?? [];
+function findApiErrorDetails(err, type) {
+    const filteredDetails = err.error.details?.filter(detail => detail['@type'] === type) ?? [];
     return filteredDetails.map(detail => GoogleApiDetailUnionSchema.parse(detail));
 }
 // Has a daily usage quota been exceeded
-function getDailyQuotaExceeded(error) {
+function isDailyQuotaExceeded(err) {
     try {
-        const quotaFailure = findApiErrorDetails(error, 'type.googleapis.com/google.rpc.QuotaFailure');
-        if (quotaFailure[0]?.violations.some(v => v.quotaId.includes('PerDay')))
-            return true;
+        // Ignore non-quota errors
+        const parsedError = parseApiError(err, 429, 'RESOURCE_EXHAUSTED');
+        if (!parsedError)
+            return undefined;
+        // Check for any daily quota violations in the structured error
+        const quotaFailure = findApiErrorDetails(parsedError, 'type.googleapis.com/google.rpc.QuotaFailure');
+        return quotaFailure[0]?.violations.some(v => v.quotaId.includes('PerDay'));
     }
-    catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        coreExports.warning(message, { title: 'Failed to parse Google ApiError QuotaFailure' });
+    catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        coreExports.info(`Failed to parse Google ApiError QuotaFailure: ${message}`);
     }
     return false;
 }
 // Attempt to extract retry-after for a 429 error
-function getRetryAfterSeconds(error) {
+function getRetryAfterSeconds(err) {
     try {
-        const { message, status } = parseApiError(error).error;
-        // Check that the error type matches
-        if (status !== 'RESOURCE_EXHAUSTED')
-            throw new Error(`Unexpected status: ${status}`);
+        // Ignore non-quota errors
+        const parsedError = parseApiError(err, 429, 'RESOURCE_EXHAUSTED');
+        if (!parsedError)
+            return undefined;
         // Attempt to extract the retry delay from the message
         const RETRY_DELAY_RE = /\b(\d+(?:\.\d+)?)s\b/;
-        const messageMatch = RETRY_DELAY_RE.exec(message);
+        const messageMatch = RETRY_DELAY_RE.exec(parsedError.error.message);
         if (messageMatch)
             return Number(messageMatch[1]);
         // Attempt to extract the retry delay from the details
-        const retryInfo = findApiErrorDetails(error, 'type.googleapis.com/google.rpc.RetryInfo');
+        const retryInfo = findApiErrorDetails(parsedError, 'type.googleapis.com/google.rpc.RetryInfo');
         const retryDelay = retryInfo[0]?.retryDelay;
         if (!retryDelay)
             throw new Error('Missing retryDelay');
@@ -64697,128 +64710,102 @@ function getRetryAfterSeconds(error) {
         // Failed to extract any retry delay
         throw new Error(`Unexpected retryDelay format: ${retryDelay}`);
     }
-    catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        coreExports.warning(message, { title: 'Failed to parse Google ApiError retry delay' });
+    catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        coreExports.info(`Failed to parse Google ApiError retry delay: ${message}`);
+    }
+}
+// Is this a retryable error
+function isRetryableApiError(err) {
+    // Not an API error
+    if (!(err instanceof ApiError))
+        return false;
+    // Use the HTTP status code to determine whether retryable
+    switch (err.status) {
+        case 429: // Too Many Requests      (RESOURCE_EXHAUSTED)
+        case 500: // Internal Server Error  (UNKNOWN, INTERNAL, DATA_LOSS)
+        case 503: // Service Unavailable    (UNAVAILABLE)
+        case 504: // Gateway Timeout        (DEADLINE_EXCEEDED)
+            return true;
+        default:
+            // All other errors are non-retryable
+            return false;
     }
 }
 
 // GitHub action
 // Copyright © 2026 Alexander Thoukydides
-// List of models and their characteristics (in descending order of capability)
-var ModelType;
-(function (ModelType) {
-    ModelType[ModelType["FlashLite"] = 0] = "FlashLite";
-    ModelType[ModelType["Flash"] = 1] = "Flash";
-    ModelType[ModelType["Pro"] = 2] = "Pro";
-})(ModelType || (ModelType = {}));
-const MODELS = [{
-        model: 'gemini-3-flash-preview',
-        type: ModelType.Flash,
-        thinkingLevel: true
-    }, {
-        model: 'gemini-2.5-flash',
-        type: ModelType.Flash,
-        thinkingLevel: true
-    }, {
-        // Gemini 3.1 Flash Lite allows 500 RPD; all others are 20 RPD
-        model: 'gemini-3.1-flash-lite-preview',
-        type: ModelType.FlashLite,
-        thinkingLevel: false
-    }, {
-        model: 'gemini-2.5-flash-lite',
-        type: ModelType.FlashLite,
-        thinkingLevel: false
-    }];
-// Number of attempts to use the preferred model
-const PREFERRED_MODEL_ATTEMPTS = 3;
-// Update inference parameters with the model for specific try
-function updateModelParams(params, options, attempt) {
-    const { fallback, fallback_lite } = options;
-    // Choose the model for this attempt
-    let modelDetails;
-    if (attempt <= PREFERRED_MODEL_ATTEMPTS || !fallback) {
-        // Use the preferred model
-        modelDetails = MODELS[0];
-        if (params.model) {
-            const found = MODELS.find(m => m.model === params.model);
-            if (found)
-                modelDetails = found;
-            else
-                coreExports.warning(`Requested model '${params.model}' not recognised`);
-        }
-    }
-    else {
-        // Iterate through available models (starting with second choice)
-        const models = fallback_lite ? MODELS : MODELS.filter(m => m.type !== ModelType.FlashLite);
-        const index = (attempt - PREFERRED_MODEL_ATTEMPTS) % models.length;
-        modelDetails = models[index];
-    }
-    // Remove any thinkingLevel configuration if unsupported by the model
-    const thinkingConfig = modelDetails.thinkingLevel ? params.config?.thinkingConfig
-        : { ...params.config?.thinkingConfig, thinkingLevel: undefined };
-    // Return the updated inference parameters for the selected model
-    const { model } = modelDetails;
-    return { ...params, model, config: { ...params.config, thinkingConfig } };
-}
-
-// GitHub action
-// Copyright © 2026 Alexander Thoukydides
-// Retryable errors
-class RetryableError extends Error {
-}
-const RETRYABLE_STATUS_CODE_RATE_LIMIT = 429;
-const RETRYABLE_STATUS_CODES_OTHER = [500, 503, 504];
 // Delay before retrying
 const MIN_RETRY_DELAY_MS = 1 * 60_000; // 1 minute (for RPM and TPM limits)
 const MIN_RETRY_JITTER_MS = 10_000; // Start with 10 seconds of random jitter
 const MAX_RETRY_JITTER_MS = 5 * 60_000; // Cap jitter at 5 minutes
 const RETRY_JITTER_FACTOR = 1.5; // Exponential backoff factor for jitter
+// Number of attempts to use the preferred model
+const PREFERRED_MODEL_ATTEMPTS = 3;
+class RetryableError extends Error {
+    failModel;
+    retryAfter;
+    constructor(message, options) {
+        super(message, options);
+        this.failModel = options?.failModel;
+        if (options?.retryAfterSeconds)
+            this.retryAfter = options.retryAfterSeconds * 1000;
+    }
+}
+class RetryableModelError extends RetryableError {
+    constructor(message, options) {
+        super(message, { retryAfterSeconds: MIN_RETRY_DELAY_MS, ...options });
+    }
+}
 // Perform an inference request
-async function geminiInference(params, options) {
-    const { gemini_api_key, max_retries, max_elapsed_minutes, fallback, fallback_lite } = options;
+async function geminiInference(fallbackParams, options) {
+    const { gemini_api_key, max_retries, max_elapsed_minutes } = options;
     const ai = new GoogleGenAI({ apiKey: gemini_api_key });
     const startTime = Date.now();
     let retryCount = 0;
     for (let attempt = 1;; attempt++) {
         try {
             // Check whether a fallback model should be used
-            const modelOptions = { fallback, fallback_lite };
-            const attemptParams = updateModelParams(params, modelOptions, attempt);
-            coreExports.info(`Inference attempt #${attempt} using model '${attemptParams.model}'`);
+            const params = fallbackParams[0];
+            assertIsDefined(params);
+            coreExports.info(`Inference attempt #${attempt} using model '${params.model}'`);
             // Attempt inference and return if successful
-            const result = await attemptInference(ai, attemptParams);
+            const response = await attemptInference(ai, params);
+            const result = checkInferenceResult(params, response);
             coreExports.info(`Inference attempt #${attempt} successful`);
             return result;
         }
         catch (err) {
             // Check whether the error is retryable
             const message = err instanceof Error ? err.message : String(err);
-            let retryDelay = MIN_RETRY_DELAY_MS;
-            if (err instanceof RetryableError) {
-                // Retryable model response error; try again after minimum delay
-                ++retryCount;
-            }
-            else if (err instanceof ApiError && err.status === RETRYABLE_STATUS_CODE_RATE_LIMIT
-                && !getDailyQuotaExceeded(err)) {
-                // Too many requests; try after delay specified in error
-                const retryAfter = getRetryAfterSeconds(err);
-                if (retryAfter)
-                    retryDelay = retryAfter * 1000;
-            }
-            else if (err instanceof ApiError && RETRYABLE_STATUS_CODES_OTHER.includes(err.status)
-                || err instanceof TypeError && err.message === 'fetch failed') {
-                // HTTP error with retryable status code; add exponentially increasing jitter
-                const jitterMultiplier = Math.pow(RETRY_JITTER_FACTOR, attempt - 1);
-                const jitterWindow = Math.min(MIN_RETRY_JITTER_MS * jitterMultiplier, MAX_RETRY_JITTER_MS);
-                retryDelay += Math.floor(Math.random() * jitterWindow);
-                // (retryCount not increased for HTTP errors)
-            }
-            else {
-                // Non-retryable error
+            if (!(err instanceof RetryableError)) {
                 throw new Error(`Inference failed with non-retryable error: ${message}`);
             }
-            // Check whether the retry limits have been exceeded
+            // Use a different model for each retry (after the initial attempts)
+            if (PREFERRED_MODEL_ATTEMPTS <= attempt) {
+                const thisParam = fallbackParams.shift();
+                if (thisParam && !err.failModel)
+                    fallbackParams.push(thisParam);
+            }
+            if (!fallbackParams.length) {
+                throw new Error(`Inference failed after exhausting all models: ${message}`);
+            }
+            // Select the retry delay
+            let retryDelay;
+            if (err.retryAfter !== undefined) {
+                // Use the delay specified in the error (e.g. from rate limiting)
+                retryDelay = err.retryAfter;
+            }
+            else {
+                // Otherwise use exponential backoff with jitter
+                const jitterMultiplier = Math.pow(RETRY_JITTER_FACTOR, attempt - 1);
+                const jitterWindow = Math.min(MIN_RETRY_JITTER_MS * jitterMultiplier, MAX_RETRY_JITTER_MS);
+                retryDelay = MIN_RETRY_DELAY_MS + Math.floor(Math.random() * jitterWindow);
+            }
+            // Only count model responses against the retry count
+            if (err instanceof RetryableModelError)
+                ++retryCount;
+            // Check whether any retry limits have been exceeded
             if (max_retries <= retryCount) {
                 throw new Error(`Inference failed after ${plural(retryCount, 'retry')}: ${message}`);
             }
@@ -64834,9 +64821,28 @@ async function geminiInference(params, options) {
 }
 // Attempt a single inference request
 async function attemptInference(ai, params) {
-    // Perform the inference
-    const result = await ai.models.generateContent(params);
-    coreExports.debug(`Raw response:\n${JSON.stringify(result, null, 4)}`);
+    try {
+        // Attempt the inference operation
+        const response = await ai.models.generateContent(params);
+        coreExports.debug(`Raw response:\n${JSON.stringify(response, null, 4)}`);
+        return response;
+    }
+    catch (cause) {
+        if (cause instanceof TypeError && cause.message === 'fetch failed') {
+            // Undici (pre-response) fetch failure
+            throw new RetryableError(cause.message, { cause });
+        }
+        else if (isRetryableApiError(cause)) {
+            // API returned a retryable HTTP error
+            const failModel = isDailyQuotaExceeded(cause);
+            const retryAfterSeconds = getRetryAfterSeconds(cause);
+            throw new RetryableError(cause.message, { cause, failModel, retryAfterSeconds });
+        }
+        throw cause;
+    }
+}
+// Check the result of an inference request
+function checkInferenceResult(params, result) {
     // Log the token usage, if available
     if (result.usageMetadata) {
         const { totalTokenCount, promptTokenCount, thoughtsTokenCount, candidatesTokenCount, cachedContentTokenCount } = result.usageMetadata;
@@ -64850,10 +64856,10 @@ async function attemptInference(ai, params) {
     const thoughts = candidate?.content?.parts?.find(part => part.thought)?.text;
     // Validate the response
     if (candidate?.finishReason !== FinishReason.STOP) {
-        throw new RetryableError(`Abnormal finish reason: ${candidate?.finishReason}`);
+        throw new RetryableModelError(`Abnormal finish reason: ${candidate?.finishReason}`);
     }
     if (!response)
-        throw new RetryableError('No text response');
+        throw new RetryableModelError('No text response');
     const schema = params.config?.responseJsonSchema;
     if (schema) {
         const zodSchema = z.fromJSONSchema(schema);
@@ -64864,7 +64870,7 @@ async function attemptInference(ai, params) {
         }
         catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            throw new RetryableError(`Structured response failed validation: ${message}`);
+            throw new RetryableModelError(`Structured response failed validation: ${message}`);
         }
     }
     // Return the text response
@@ -64886,24 +64892,19 @@ function writeTmpFile(prefix, ext, content) {
 
 // GitHub action
 // Copyright © 2026 Alexander Thoukydides
-// Prepare the inference parameters
-function prepareInferenceParams(prompt, maxOutputTokens, variables) {
-    const { model, messages } = prompt;
-    const config = { maxOutputTokens };
+// Prepare the inference parameters for all models in the fallback list
+function prepareInferenceParams(modelDetails, prompt, maxOutputTokens, variables) {
     // Substitute template variables in messages
-    const { systemInstruction, contents } = prepareMessages(messages, variables);
-    config.systemInstruction = systemInstruction;
+    const messages = prepareMessages(prompt.messages, variables);
     // Prepare schema for structured response if required
-    if ('jsonSchema' in prompt) {
-        config.responseMimeType = 'application/json';
-        try {
-            config.responseJsonSchema = JSON.parse(prompt.jsonSchema);
-        }
-        catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            throw new Error(`Failed to parse JSON schema: ${message}`);
-        }
-    }
+    const responseSchema = prepareResponse(prompt);
+    // Prepare the parameters for each fallback model
+    return modelDetails.map(md => prepareModelParams(md, prompt, maxOutputTokens, messages, responseSchema));
+}
+// Prepare the inference parameters for a single model
+function prepareModelParams(modelDetails, prompt, maxOutputTokens, messages, responseSchema) {
+    const { model } = modelDetails;
+    const { systemInstruction, contents } = messages;
     // Map the thinking level and enable thought summaries in the output
     const thinkingLevelMap = {
         'minimal': ThinkingLevel.MINIMAL,
@@ -64911,9 +64912,26 @@ function prepareInferenceParams(prompt, maxOutputTokens, variables) {
         'medium': ThinkingLevel.MEDIUM,
         'high': ThinkingLevel.HIGH
     };
-    const thinkingLevel = thinkingLevelMap[prompt.thinkingLevel ?? 'high'];
-    config.thinkingConfig = { includeThoughts: true, thinkingLevel };
+    const thinkingLevel = modelDetails.thinkingLevel ? thinkingLevelMap[prompt.thinkingLevel ?? 'high'] : undefined;
+    const thinkingConfig = { includeThoughts: true, thinkingLevel };
+    // Build the inference configuration
+    const config = { maxOutputTokens, systemInstruction, thinkingConfig, ...responseSchema };
     return { model, config, contents };
+}
+// Prepare the response type and schema
+function prepareResponse(prompt) {
+    if (!('jsonSchema' in prompt))
+        return {};
+    try {
+        return {
+            responseMimeType: 'application/json',
+            responseJsonSchema: JSON.parse(prompt.jsonSchema)
+        };
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`Failed to parse JSON schema: ${message}`);
+    }
 }
 // Prepare the system and user messages for the input context
 function prepareMessages(messages, variables) {
@@ -64926,6 +64944,49 @@ function prepareMessages(messages, variables) {
     // Convert the user messages to the format expected by the API
     const contents = finalMessages.map(m => ({ role: m.role, parts: [{ text: m.content }] }));
     return { systemInstruction, contents };
+}
+
+// GitHub action
+// Copyright © 2026 Alexander Thoukydides
+// List of models and their characteristics (in descending order of capability)
+var ModelType;
+(function (ModelType) {
+    ModelType[ModelType["FlashLite"] = 0] = "FlashLite";
+    ModelType[ModelType["Flash"] = 1] = "Flash";
+    ModelType[ModelType["Pro"] = 2] = "Pro";
+})(ModelType || (ModelType = {}));
+const MODELS = [{
+        model: 'gemini-3-flash-preview',
+        type: ModelType.Flash,
+        thinkingLevel: true
+    }, {
+        model: 'gemini-2.5-flash',
+        type: ModelType.Flash,
+        thinkingLevel: false
+    }, {
+        // Gemini 3.1 Flash Lite allows 500 RPD; all others are 20 RPD
+        model: 'gemini-3.1-flash-lite-preview',
+        type: ModelType.FlashLite,
+        thinkingLevel: true
+    }, {
+        model: 'gemini-2.5-flash-lite',
+        type: ModelType.FlashLite,
+        thinkingLevel: false
+    }];
+// Get the preferred and any fallback models
+function getModels(fallback, fallback_lite, preferred) {
+    // Select the fallback models, if any
+    const allFallbackModels = fallback ? MODELS.filter(m => fallback_lite || m.type !== ModelType.FlashLite) : [];
+    // Choose the preferred model
+    const foundPreferred = MODELS.find(m => m.model === preferred);
+    const preferredModel = foundPreferred ?? allFallbackModels[0] ?? MODELS[0];
+    assertIsDefined(preferredModel);
+    if (preferred && !foundPreferred) {
+        coreExports.warning(`Requested model '${preferred}' not recognised; using '${preferredModel.model}' instead`);
+    }
+    // Avoid duplicating the preferred model in the fallback list
+    const fallbackModels = allFallbackModels.filter(m => m !== preferredModel);
+    return [preferredModel, ...fallbackModels];
 }
 
 // GitHub action
@@ -64944,18 +65005,20 @@ async function run() {
     const fallback_lite = coreExports.getBooleanInput('fallback_lite', { required: true });
     // Load the prompt file
     const prompt = loadPromptFile(prompt_file);
+    // Choose the model(s) to use for inference
+    const models = getModels(fallback, fallback_lite, prompt.model);
     // Substitute template variables in the prompt messages
     const variables = {
         ...parseTemplateVariables(input),
         ...parseFileTemplateVariables(file_input)
     };
-    const params = prepareInferenceParams(prompt, max_tokens, variables);
+    const params = prepareInferenceParams(models, prompt, max_tokens, variables);
     // Log the request
     coreExports.startGroup('Inference request');
     coreExports.info(JSON.stringify(params, null, 4));
     coreExports.endGroup();
     // Perform the inference
-    const inferenceOptions = { gemini_api_key, max_retries, max_elapsed_minutes, fallback, fallback_lite };
+    const inferenceOptions = { gemini_api_key, max_retries, max_elapsed_minutes };
     const { response, thoughts } = await geminiInference(params, inferenceOptions);
     // Log the response
     coreExports.startGroup('Inference response');

@@ -2,22 +2,18 @@
 // Copyright © 2026 Alexander Thoukydides
 
 import * as core from '@actions/core';
-import { ApiError, FinishReason, GenerateContentParameters, GoogleGenAI } from '@google/genai';
+import { FinishReason, GenerateContentParameters, GenerateContentResponse, GoogleGenAI } from '@google/genai';
 import z from 'zod';
 import { JSONSchema } from 'zod/v4/core';
 import { setTimeout } from 'node:timers/promises';
-import { formatMilliseconds, plural } from './utils';
-import { getDailyQuotaExceeded, getRetryAfterSeconds } from './apierror';
-import { ModelOptions, updateModelParams } from './models';
-import { InferenceParams } from './inference-params';
+import { assertIsDefined, formatMilliseconds, plural } from './utils';
+import { isDailyQuotaExceeded, getRetryAfterSeconds, isRetryableApiError } from './apierror';
 
 // Inference options
 export interface InferenceOptions {
     gemini_api_key:         string;
     max_retries:            number;
     max_elapsed_minutes:    number;
-    fallback:               boolean;
-    fallback_lite:          boolean;
 }
 
 // Inference response
@@ -26,20 +22,38 @@ export interface InferenceResponse {
     thoughts?:  string;
 }
 
-// Retryable errors
-class RetryableError extends Error {}
-const RETRYABLE_STATUS_CODE_RATE_LIMIT = 429;
-const RETRYABLE_STATUS_CODES_OTHER = [500, 503, 504];
-
 // Delay before retrying
 const MIN_RETRY_DELAY_MS    = 1 * 60_000;   // 1 minute (for RPM and TPM limits)
 const MIN_RETRY_JITTER_MS   =     10_000;   // Start with 10 seconds of random jitter
 const MAX_RETRY_JITTER_MS   = 5 * 60_000;   // Cap jitter at 5 minutes
 const RETRY_JITTER_FACTOR   = 1.5;          // Exponential backoff factor for jitter
 
+// Number of attempts to use the preferred model
+const PREFERRED_MODEL_ATTEMPTS = 3;
+
+// Retryable errors (excluding ApiError thrown by @google/genai)
+interface RetryableErrorOptions extends ErrorOptions {
+    failModel?:         boolean;
+    retryAfterSeconds?: number;
+}
+class RetryableError extends Error {
+    failModel?:     boolean;
+    retryAfter?:    number;
+    constructor(message: string, options?: RetryableErrorOptions) {
+        super(message, options);
+        this.failModel = options?.failModel;
+        if (options?.retryAfterSeconds) this.retryAfter = options.retryAfterSeconds * 1000;
+    }
+}
+class RetryableModelError extends RetryableError {
+    constructor(message: string, options?: RetryableErrorOptions) {
+        super(message, { retryAfterSeconds: MIN_RETRY_DELAY_MS, ...options} );
+    }
+}
+
 // Perform an inference request
-export async function geminiInference(params: InferenceParams, options: InferenceOptions): Promise<InferenceResponse> {
-    const { gemini_api_key, max_retries, max_elapsed_minutes, fallback, fallback_lite } = options;
+export async function geminiInference(fallbackParams: GenerateContentParameters[], options: InferenceOptions): Promise<InferenceResponse> {
+    const { gemini_api_key, max_retries, max_elapsed_minutes } = options;
     const ai = new GoogleGenAI({ apiKey: gemini_api_key });
 
     const startTime = Date.now();
@@ -47,40 +61,48 @@ export async function geminiInference(params: InferenceParams, options: Inferenc
     for (let attempt = 1;; attempt++) {
         try {
             // Check whether a fallback model should be used
-            const modelOptions: ModelOptions = { fallback, fallback_lite };
-            const attemptParams = updateModelParams(params, modelOptions, attempt);
-            core.info(`Inference attempt #${attempt} using model '${attemptParams.model}'`);
+            const params = fallbackParams[0];
+            assertIsDefined(params);
+            core.info(`Inference attempt #${attempt} using model '${params.model}'`);
 
             // Attempt inference and return if successful
-            const result = await attemptInference(ai, attemptParams);
+            const response = await attemptInference(ai, params);
+            const result = checkInferenceResult(params, response);
             core.info(`Inference attempt #${attempt} successful`);
             return result;
 
         } catch (err) {
             // Check whether the error is retryable
             const message = err instanceof Error ? err.message : String(err);
-            let retryDelay = MIN_RETRY_DELAY_MS;
-            if (err instanceof RetryableError) {
-                // Retryable model response error; try again after minimum delay
-                ++retryCount;
-            } else if (err instanceof ApiError && err.status === RETRYABLE_STATUS_CODE_RATE_LIMIT
-                && !getDailyQuotaExceeded(err)) {
-                // Too many requests; try after delay specified in error
-                const retryAfter = getRetryAfterSeconds(err);
-                if (retryAfter) retryDelay = retryAfter * 1000;
-            } else if (err instanceof ApiError && RETRYABLE_STATUS_CODES_OTHER.includes(err.status)
-                || err instanceof TypeError && err.message === 'fetch failed') {
-                // HTTP error with retryable status code; add exponentially increasing jitter
-                const jitterMultiplier = Math.pow(RETRY_JITTER_FACTOR, attempt - 1);
-                const jitterWindow = Math.min(MIN_RETRY_JITTER_MS * jitterMultiplier, MAX_RETRY_JITTER_MS);
-                retryDelay += Math.floor(Math.random() * jitterWindow);
-                // (retryCount not increased for HTTP errors)
-            } else {
-                // Non-retryable error
+            if (!(err instanceof RetryableError)) {
                 throw new Error(`Inference failed with non-retryable error: ${message}`);
             }
 
-            // Check whether the retry limits have been exceeded
+            // Use a different model for each retry (after the initial attempts)
+            if (PREFERRED_MODEL_ATTEMPTS <= attempt) {
+                const thisParam = fallbackParams.shift();
+                if (thisParam && !err.failModel) fallbackParams.push(thisParam);
+            }
+            if (!fallbackParams.length) {
+                throw new Error(`Inference failed after exhausting all models: ${message}`);
+            }
+
+            // Select the retry delay
+            let retryDelay: number;
+            if (err.retryAfter !== undefined) {
+                // Use the delay specified in the error (e.g. from rate limiting)
+                retryDelay = err.retryAfter;
+            } else {
+                // Otherwise use exponential backoff with jitter
+                const jitterMultiplier = Math.pow(RETRY_JITTER_FACTOR, attempt - 1);
+                const jitterWindow = Math.min(MIN_RETRY_JITTER_MS * jitterMultiplier, MAX_RETRY_JITTER_MS);
+                retryDelay = MIN_RETRY_DELAY_MS + Math.floor(Math.random() * jitterWindow);
+            }
+
+            // Only count model responses against the retry count
+            if (err instanceof RetryableModelError) ++retryCount;
+
+            // Check whether any retry limits have been exceeded
             if (max_retries <= retryCount) {
                 throw new Error(`Inference failed after ${plural(retryCount, 'retry')}: ${message}`);
             } else if (startTime + max_elapsed_minutes * 60_000 < Date.now() + retryDelay) {
@@ -96,11 +118,29 @@ export async function geminiInference(params: InferenceParams, options: Inferenc
 }
 
 // Attempt a single inference request
-async function attemptInference(ai: GoogleGenAI, params: GenerateContentParameters): Promise<InferenceResponse> {
-    // Perform the inference
-    const result = await ai.models.generateContent(params);
-    core.debug(`Raw response:\n${JSON.stringify(result, null, 4)}`);
+async function attemptInference(ai: GoogleGenAI, params: GenerateContentParameters): Promise<GenerateContentResponse> {
+    try {
+        // Attempt the inference operation
+        const response = await ai.models.generateContent(params);
+        core.debug(`Raw response:\n${JSON.stringify(response, null, 4)}`);
+        return response;
 
+    } catch (cause) {
+        if (cause instanceof TypeError && cause.message === 'fetch failed') {
+            // Undici (pre-response) fetch failure
+            throw new RetryableError(cause.message, { cause });
+        } else if (isRetryableApiError(cause)) {
+            // API returned a retryable HTTP error
+            const failModel = isDailyQuotaExceeded(cause);
+            const retryAfterSeconds = getRetryAfterSeconds(cause);
+            throw new RetryableError(cause.message, { cause, failModel, retryAfterSeconds });
+        }
+        throw cause;
+    }
+}
+
+// Check the result of an inference request
+function checkInferenceResult(params: GenerateContentParameters, result: GenerateContentResponse): InferenceResponse {
     // Log the token usage, if available
     if (result.usageMetadata) {
         const { totalTokenCount, promptTokenCount, thoughtsTokenCount,
@@ -117,9 +157,9 @@ async function attemptInference(ai: GoogleGenAI, params: GenerateContentParamete
 
     // Validate the response
     if (candidate?.finishReason !== FinishReason.STOP) {
-        throw new RetryableError(`Abnormal finish reason: ${candidate?.finishReason}`);
+        throw new RetryableModelError(`Abnormal finish reason: ${candidate?.finishReason}`);
     }
-    if (!response) throw new RetryableError('No text response');
+    if (!response) throw new RetryableModelError('No text response');
     const schema = params.config?.responseJsonSchema;
     if (schema) {
         const zodSchema = z.fromJSONSchema(schema as JSONSchema.JSONSchema);
@@ -129,10 +169,11 @@ async function attemptInference(ai: GoogleGenAI, params: GenerateContentParamete
             void zodSchema.parse(json); // (validation only; result discarded)
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            throw new RetryableError(`Structured response failed validation: ${message}`);
+            throw new RetryableModelError(`Structured response failed validation: ${message}`);
         }
     }
 
     // Return the text response
     return { response, thoughts };
+
 }

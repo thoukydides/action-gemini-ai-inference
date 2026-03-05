@@ -127,63 +127,58 @@ const GoogleApiErrorSchema = z.object({
 });
 export type GoogleApiError = z.infer<typeof GoogleApiErrorSchema>;
 
-// Parse a Google API error
-export function parseApiError(error: ApiError): GoogleApiError {
-    const json = JSON.parse(error.message) as unknown;
-    return GoogleApiErrorSchema.parse(json);
+// Parse a Google API error (returning undefined if code/status do not match)
+export function parseApiError(err: unknown, code?: number, status?: z.infer<typeof GeminiStatusSchema>): GoogleApiError | undefined {
+    // Only attempt to parse ApiError messages with matching HTTP status code
+    if (!(err instanceof ApiError)) return;
+    if (code !== undefined && err.status !== code) return;
+
+    // Attempt to parse and validate the error message as JSON
+    const json = JSON.parse(err.message) as unknown;
+    const parsedError = GoogleApiErrorSchema.parse(json);
+
+    // Return the parsed error if the status code matches
+    if (status !== undefined && parsedError.error.status !== status) return;
+    return parsedError;
 }
 
 // Find any matching detail(s) from a Google API error
-export function findApiErrorDetails<T extends GoogleApiDetailType>(error: ApiError, type: T): GoogleApiDetail<T>[] {
-    const parsedError = parseApiError(error);
-    const filteredDetails = parsedError.error.details?.filter(detail => detail['@type'] === type) ?? [];
+export function findApiErrorDetails<T extends GoogleApiDetailType>(err: GoogleApiError, type: T): GoogleApiDetail<T>[] {
+    const filteredDetails = err.error.details?.filter(detail => detail['@type'] === type) ?? [];
     return filteredDetails.map(detail => GoogleApiDetailUnionSchema.parse(detail) as GoogleApiDetail<T>);
 }
 
-export function isRetryableRateLimit(error: ApiError): boolean {
-    try {
-        if (error.status !== 429) return false;
-        const { status } = parseApiError(error).error;
-        if (status !== 'RESOURCE_EXHAUSTED') return false;
-
-
-        return true;
-    } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        core.warning(message, { title: 'Failed to parse Google ApiError rate limit' });
-    }
-
-    // Do not retry other errors
-    return false;
-}
-
 // Has a daily usage quota been exceeded
-export function getDailyQuotaExceeded(error: ApiError): boolean {
+export function isDailyQuotaExceeded(err: unknown): boolean | undefined {
     try {
-        const quotaFailure = findApiErrorDetails(error, 'type.googleapis.com/google.rpc.QuotaFailure');
-        if (quotaFailure[0]?.violations.some(v => v.quotaId.includes('PerDay'))) return true;
-    } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        core.warning(message, { title: 'Failed to parse Google ApiError QuotaFailure' });
+        // Ignore non-quota errors
+        const parsedError = parseApiError(err, 429, 'RESOURCE_EXHAUSTED');
+        if (!parsedError) return undefined;
+
+        // Check for any daily quota violations in the structured error
+        const quotaFailure = findApiErrorDetails(parsedError, 'type.googleapis.com/google.rpc.QuotaFailure');
+        return quotaFailure[0]?.violations.some(v => v.quotaId.includes('PerDay'));
+    } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        core.info(`Failed to parse Google ApiError QuotaFailure: ${message}`);
     }
     return false;
 }
 
 // Attempt to extract retry-after for a 429 error
-export function getRetryAfterSeconds(error: ApiError): number | undefined {
+export function getRetryAfterSeconds(err: ApiError): number | undefined {
     try {
-        const { message, status } = parseApiError(error).error;
-
-        // Check that the error type matches
-        if (status !== 'RESOURCE_EXHAUSTED') throw new Error(`Unexpected status: ${status}`);
+        // Ignore non-quota errors
+        const parsedError = parseApiError(err, 429, 'RESOURCE_EXHAUSTED');
+        if (!parsedError) return undefined;
 
         // Attempt to extract the retry delay from the message
         const RETRY_DELAY_RE = /\b(\d+(?:\.\d+)?)s\b/;
-        const messageMatch = RETRY_DELAY_RE.exec(message);
+        const messageMatch = RETRY_DELAY_RE.exec(parsedError.error.message);
         if (messageMatch) return Number(messageMatch[1]);
 
         // Attempt to extract the retry delay from the details
-        const retryInfo = findApiErrorDetails(error, 'type.googleapis.com/google.rpc.RetryInfo');
+        const retryInfo = findApiErrorDetails(parsedError, 'type.googleapis.com/google.rpc.RetryInfo');
         const retryDelay = retryInfo[0]?.retryDelay;
         if (!retryDelay) throw new Error('Missing retryDelay');
         const infoMatch = RETRY_DELAY_RE.exec(retryDelay);
@@ -191,8 +186,26 @@ export function getRetryAfterSeconds(error: ApiError): number | undefined {
 
         // Failed to extract any retry delay
         throw new Error(`Unexpected retryDelay format: ${retryDelay}`);
-    } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        core.warning(message, { title: 'Failed to parse Google ApiError retry delay' });
+    } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        core.info(`Failed to parse Google ApiError retry delay: ${message}`);
+    }
+}
+
+// Is this a retryable error
+export function isRetryableApiError(err: unknown): err is ApiError {
+    // Not an API error
+    if (!(err instanceof ApiError)) return false;
+
+    // Use the HTTP status code to determine whether retryable
+    switch (err.status) {
+    case 429: // Too Many Requests      (RESOURCE_EXHAUSTED)
+    case 500: // Internal Server Error  (UNKNOWN, INTERNAL, DATA_LOSS)
+    case 503: // Service Unavailable    (UNAVAILABLE)
+    case 504: // Gateway Timeout        (DEADLINE_EXCEEDED)
+        return true;
+    default:
+        // All other errors are non-retryable
+        return false;
     }
 }

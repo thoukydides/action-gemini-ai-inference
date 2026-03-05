@@ -1,32 +1,48 @@
 // GitHub action
 // Copyright © 2026 Alexander Thoukydides
 
-import { ContentListUnion, ContentUnion, GenerateContentConfig, GenerateContentParameters, ThinkingLevel } from '@google/genai';
+import { ContentListUnion, ContentUnion, GenerateContentConfig,
+         GenerateContentParameters, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { Prompt } from './prompt';
 import { replaceTemplateVariables, TemplateVariables } from './template';
+import { ModelDetails } from './models';
 
-// Inference parameters with optional model
-export type InferenceParams = Omit<GenerateContentParameters, 'model'> & { model?: string };
+// Prepared response type and schema
+type InferenceResponseSchema = Pick<GenerateContentConfig, 'responseMimeType' | 'responseJsonSchema'>;
 
-// Prepare the inference parameters
-export function prepareInferenceParams(prompt: Prompt, maxOutputTokens: number, variables: TemplateVariables): InferenceParams {
-    const { model, messages } = prompt;
-    const config: GenerateContentConfig = { maxOutputTokens };
+// Prepared system and user messages for the input context
+interface InferenceMessages {
+    systemInstruction?: ContentUnion;
+    contents:           ContentListUnion;
+}
 
+// Prepare the inference parameters for all models in the fallback list
+export function prepareInferenceParams(
+    modelDetails:       ModelDetails[],
+    prompt:             Prompt,
+    maxOutputTokens:    number,
+    variables:          TemplateVariables
+): GenerateContentParameters[] {
     // Substitute template variables in messages
-    const { systemInstruction, contents } = prepareMessages(messages, variables);
-    config.systemInstruction = systemInstruction;
+    const messages = prepareMessages(prompt.messages, variables);
 
     // Prepare schema for structured response if required
-    if ('jsonSchema' in prompt) {
-        config.responseMimeType = 'application/json';
-        try {
-            config.responseJsonSchema = JSON.parse(prompt.jsonSchema) as unknown;
-        } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            throw new Error(`Failed to parse JSON schema: ${message}`);
-        }
-    }
+    const responseSchema = prepareResponse(prompt);
+
+    // Prepare the parameters for each fallback model
+    return modelDetails.map(md => prepareModelParams(md, prompt, maxOutputTokens, messages, responseSchema));
+}
+
+// Prepare the inference parameters for a single model
+function prepareModelParams(
+    modelDetails:       ModelDetails,
+    prompt:             Prompt,
+    maxOutputTokens:    number,
+    messages:           InferenceMessages,
+    responseSchema:     InferenceResponseSchema
+): GenerateContentParameters {
+    const { model } = modelDetails;
+    const { systemInstruction, contents } = messages;
 
     // Map the thinking level and enable thought summaries in the output
     const thinkingLevelMap: Record<NonNullable<Prompt['thinkingLevel']>, ThinkingLevel> = {
@@ -35,17 +51,33 @@ export function prepareInferenceParams(prompt: Prompt, maxOutputTokens: number, 
         'medium':  ThinkingLevel.MEDIUM,
         'high':    ThinkingLevel.HIGH
     };
-    const thinkingLevel = thinkingLevelMap[prompt.thinkingLevel ?? 'high'];
-    config.thinkingConfig = { includeThoughts: true, thinkingLevel };
+    const thinkingLevel = modelDetails.thinkingLevel ? thinkingLevelMap[prompt.thinkingLevel ?? 'high'] : undefined;
+    const thinkingConfig: ThinkingConfig  = { includeThoughts: true, thinkingLevel };
 
-    return { model, config, contents } satisfies InferenceParams;
+    // Build the inference configuration
+    const config: GenerateContentConfig = { maxOutputTokens, systemInstruction, thinkingConfig, ...responseSchema };
+    return { model, config, contents } satisfies GenerateContentParameters;
+}
+
+// Prepare the response type and schema
+function prepareResponse(prompt: Prompt): InferenceResponseSchema {
+    if (!('jsonSchema' in prompt)) return {};
+    try {
+        return {
+            responseMimeType:   'application/json',
+            responseJsonSchema: JSON.parse(prompt.jsonSchema) as unknown
+        };
+    } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`Failed to parse JSON schema: ${message}`);
+    }
 }
 
 // Prepare the system and user messages for the input context
 function prepareMessages(
     messages:   Prompt['messages'],
     variables:  TemplateVariables
-): { systemInstruction?: ContentUnion; contents: ContentListUnion } {
+): InferenceMessages {
     // Substitute template variables
     const finalMessages = messages.map(message =>
         ({ ...message, content: replaceTemplateVariables(message.content, variables) })) as Prompt['messages'];

@@ -7,6 +7,7 @@ import { parseFileTemplateVariables, parseTemplateVariables } from './template.j
 import { geminiInference, InferenceOptions } from './inference.js';
 import { writeTmpFile } from './tmpfile.js';
 import { prepareInferenceParams } from './inference-params.js';
+import { getModels } from './models.js';
 
 // Script entry point
 async function run(): Promise<void> {
@@ -24,12 +25,15 @@ async function run(): Promise<void> {
     // Load the prompt file
     const prompt = loadPromptFile(prompt_file);
 
+    // Choose the model(s) to use for inference
+    const models = getModels(fallback, fallback_lite, prompt.model);
+
     // Substitute template variables in the prompt messages
     const variables = {
         ...parseTemplateVariables(input),
         ...parseFileTemplateVariables(file_input)
     };
-    const params = prepareInferenceParams(prompt, max_tokens, variables);
+    const params = prepareInferenceParams(models, prompt, max_tokens, variables);
 
     // Log the request
     core.startGroup('Inference request');
@@ -38,7 +42,7 @@ async function run(): Promise<void> {
 
     // Perform the inference
     const inferenceOptions: InferenceOptions =
-        { gemini_api_key, max_retries, max_elapsed_minutes, fallback, fallback_lite };
+        { gemini_api_key, max_retries, max_elapsed_minutes };
     const { response, thoughts } = await geminiInference(params, inferenceOptions);
 
     // Log the response
