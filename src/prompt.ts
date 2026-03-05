@@ -13,7 +13,7 @@ const makeMessageSchema = <T extends string>(role: T) => z.strictObject({
 const SystemMessageSchema = makeMessageSchema('system');
 const UserMessageSchema   = makeMessageSchema('user');
 const BasePromptSchema = z.strictObject({
-    model:          z.string(),
+    model:          z.optional(z.string()),
     thinkingLevel:  z.optional(z.enum(['minimal', 'low', 'medium', 'high'])),
     messages:       z.union([
         z.tuple([UserMessageSchema], UserMessageSchema),

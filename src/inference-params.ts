@@ -5,8 +5,11 @@ import { ContentListUnion, ContentUnion, GenerateContentConfig, GenerateContentP
 import { Prompt } from './prompt';
 import { replaceTemplateVariables, TemplateVariables } from './template';
 
+// Inference parameters with optional model
+export type InferenceParams = Omit<GenerateContentParameters, 'model'> & { model?: string };
+
 // Prepare the inference parameters
-export function prepareInferenceParams(prompt: Prompt, maxOutputTokens: number, variables: TemplateVariables): GenerateContentParameters {
+export function prepareInferenceParams(prompt: Prompt, maxOutputTokens: number, variables: TemplateVariables): InferenceParams {
     const { model, messages } = prompt;
     const config: GenerateContentConfig = { maxOutputTokens };
 
@@ -35,7 +38,7 @@ export function prepareInferenceParams(prompt: Prompt, maxOutputTokens: number, 
     const thinkingLevel = thinkingLevelMap[prompt.thinkingLevel ?? 'high'];
     config.thinkingConfig = { includeThoughts: true, thinkingLevel };
 
-    return { model, config, contents } satisfies GenerateContentParameters;
+    return { model, config, contents } satisfies InferenceParams;
 }
 
 // Prepare the system and user messages for the input context

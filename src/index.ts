@@ -4,20 +4,22 @@
 import * as core from '@actions/core';
 import { loadPromptFile } from './prompt.js';
 import { parseFileTemplateVariables, parseTemplateVariables } from './template.js';
-import { geminiInference } from './inference.js';
+import { geminiInference, InferenceOptions } from './inference.js';
 import { writeTmpFile } from './tmpfile.js';
 import { prepareInferenceParams } from './inference-params.js';
 
 // Script entry point
 async function run(): Promise<void> {
     // Action inputs
-    const gemini_api_key        =        core.getInput('gemini_api_key',        { required: true });
-    const prompt_file           =        core.getInput('prompt_file',           { required: true });
-    const input                 =        core.getInput('input',                 { required: false });
-    const file_input            =        core.getInput('file_input',            { required: false });
-    const max_tokens            = Number(core.getInput('max_tokens',            { required: true }));
-    const max_retries           = Number(core.getInput('max_retries',           { required: true }));
-    const max_elapsed_minutes   = Number(core.getInput('max_elapsed_minutes',   { required: true }));
+    const gemini_api_key        =        core.getInput       ('gemini_api_key',         { required: true });
+    const prompt_file           =        core.getInput       ('prompt_file',            { required: true });
+    const input                 =        core.getInput       ('input',                  { required: false });
+    const file_input            =        core.getInput       ('file_input',             { required: false });
+    const max_tokens            = Number(core.getInput       ('max_tokens',             { required: true }));
+    const max_retries           = Number(core.getInput       ('max_retries',            { required: true }));
+    const max_elapsed_minutes   = Number(core.getInput       ('max_elapsed_minutes',    { required: true }));
+    const fallback              =        core.getBooleanInput('fallback',               { required: true });
+    const fallback_lite         =        core.getBooleanInput('fallback_lite',          { required: true });
 
     // Load the prompt file
     const prompt = loadPromptFile(prompt_file);
@@ -35,7 +37,9 @@ async function run(): Promise<void> {
     core.endGroup();
 
     // Perform the inference
-    const { response, thoughts } = await geminiInference(gemini_api_key, params, max_retries, max_elapsed_minutes);
+    const inferenceOptions: InferenceOptions =
+        { gemini_api_key, max_retries, max_elapsed_minutes, fallback, fallback_lite };
+    const { response, thoughts } = await geminiInference(params, inferenceOptions);
 
     // Log the response
     core.startGroup('Inference response');

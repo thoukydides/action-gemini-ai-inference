@@ -8,6 +8,17 @@ import { JSONSchema } from 'zod/v4/core';
 import { setTimeout } from 'node:timers/promises';
 import { formatMilliseconds, plural } from './utils';
 import { getDailyQuotaExceeded, getRetryAfterSeconds } from './apierror';
+import { ModelOptions, updateModelParams } from './models';
+import { InferenceParams } from './inference-params';
+
+// Inference options
+export interface InferenceOptions {
+    gemini_api_key:         string;
+    max_retries:            number;
+    max_elapsed_minutes:    number;
+    fallback:               boolean;
+    fallback_lite:          boolean;
+}
 
 // Inference response
 export interface InferenceResponse {
@@ -27,18 +38,21 @@ const MAX_RETRY_JITTER_MS   = 5 * 60_000;   // Cap jitter at 5 minutes
 const RETRY_JITTER_FACTOR   = 1.5;          // Exponential backoff factor for jitter
 
 // Perform an inference request
-export async function geminiInference(
-    apiKey:             string,
-    params:             GenerateContentParameters,
-    maxRetries:         number,
-    maxElapsedMinutes:  number
-): Promise<InferenceResponse> {
+export async function geminiInference(params: InferenceParams, options: InferenceOptions): Promise<InferenceResponse> {
+    const { gemini_api_key, max_retries, max_elapsed_minutes, fallback, fallback_lite } = options;
+    const ai = new GoogleGenAI({ apiKey: gemini_api_key });
+
     const startTime = Date.now();
     let retryCount = 0;
     for (let attempt = 1;; attempt++) {
         try {
+            // Check whether a fallback model should be used
+            const modelOptions: ModelOptions = { fallback, fallback_lite };
+            const attemptParams = updateModelParams(params, modelOptions, attempt);
+            core.info(`Inference attempt #${attempt} using model '${attemptParams.model}'`);
+
             // Attempt inference and return if successful
-            const result = await attemptInference(apiKey, params);
+            const result = await attemptInference(ai, attemptParams);
             core.info(`Inference attempt #${attempt} successful`);
             return result;
 
@@ -67,24 +81,23 @@ export async function geminiInference(
             }
 
             // Check whether the retry limits have been exceeded
-            if (maxRetries <= retryCount) {
+            if (max_retries <= retryCount) {
                 throw new Error(`Inference failed after ${plural(retryCount, 'retry')}: ${message}`);
-            } else if (startTime + maxElapsedMinutes * 60_000 < Date.now() + retryDelay) {
+            } else if (startTime + max_elapsed_minutes * 60_000 < Date.now() + retryDelay) {
                 throw new Error(`Inference failed after ${formatMilliseconds(Date.now() - startTime)} elapsed: ${message}`);
             }
 
             // Log the retryable error and retry after a delay
             core.info(`Inference attempt #${attempt} failed: ${message}`);
-            core.info(`Trying again in ${formatMilliseconds(retryDelay)} (${retryCount} of ${plural(maxRetries, 'retry')})...`);
+            core.info(`Trying again in ${formatMilliseconds(retryDelay)} (${retryCount} of ${plural(max_retries, 'retry')})...`);
             await setTimeout(retryDelay);
         }
     }
 }
 
 // Attempt a single inference request
-async function attemptInference(apiKey: string, params: GenerateContentParameters): Promise<InferenceResponse> {
+async function attemptInference(ai: GoogleGenAI, params: GenerateContentParameters): Promise<InferenceResponse> {
     // Perform the inference
-    const ai = new GoogleGenAI({ apiKey });
     const result = await ai.models.generateContent(params);
     core.debug(`Raw response:\n${JSON.stringify(result, null, 4)}`);
 

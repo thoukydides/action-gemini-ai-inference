@@ -34,6 +34,14 @@ inputs:
     description: The maximum elapsed time to obtain a valid inference result
     type: number
     default: 45
+  fallback:
+    description: Allow use of alternative models if the primary model fails
+    type: boolean
+    default: true
+  fallback_lite:
+    description: Include 'lite' models in fallback list
+    type: boolean
+    default: false
 
 outputs:
   response:

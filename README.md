@@ -1,6 +1,6 @@
 # `action-gemini-ai-inference`
 
-This action implements similar functionality to [actions/ai-inference](https://github.com/actions/ai-inference), except that it is optimised for **Gemini 3** models accessed via native Google AI Studio APIs.
+This action implements similar functionality to [actions/ai-inference](https://github.com/actions/ai-inference), except that it is optimised for **Gemini** models accessed via native Google AI Studio APIs.
 
 The following additional features are implemented:
 - Full model input and output are logged
@@ -9,6 +9,7 @@ The following additional features are implemented:
 - Model thought summaries are captured, logged, and returned as outputs
 - If structured output is used then the response is validated against the provided schema
 - Some failures are retried a limited number of times
+- Retries can fallback to less capable models
 
 The following features of `actions/ai-inference` are not supported:
 - Use of OpenAI compatible APIs (only native AI Studio Gemini APIs are used)
@@ -43,6 +44,8 @@ Various inputs are defined in the action to configure its operation:
 | `max_tokens` | The maximum number of tokens to generate (includes dynamic thinking and thought summary) | `65536`
 | `max_retries` | The maximum number of attempts to obtain a valid inference result | `5`
 | `max_elapsed_minutes` | The maximum elapsed time to obtain a valid inference result | `45`
+| `fallback` | Allow use of alternative models if the primary model fails | `true`
+| `fallback_lite` | Include 'lite' models in fallback list | `false`
 
 Only successful API requests are counted against the `max_retries` limit. Retryable HTTP errors preserve the retry counter, but are constrained by `max_elapsed_minutes`.
 
@@ -62,11 +65,14 @@ The YAML prompt file accepts the following scalars:
 
 | Name | Description | Default
 | --- | --- | ---
-| `model` | The model to use | `gemini-3-flash-preview`
+| `model` | The model to use | `""`
 | `thinkingLevel` | Model reasoning behaviour: `minimal`, `low`, `medium`, or `high` | `high`
 | `messages` | A list of input context messages (`role` and `content`); an optional `system` message followed by one or more `user` messages | *required*
 | `responseFormat` | Omit for a plain text response or set to `json_schema` for structured output | `""`
 | `jsonSchema` | If `responseFormat` is `json_schema` then a JSON schema to validate the response against | `""`
+
+> [!TIP]
+> Omit `model` to automatically use the best available model for the initial attempt(s). Fallback to alternative models occurs regardless (if enabled by the `fallback` input).
 
 ## ISC License (ISC)
 

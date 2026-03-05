@@ -44687,7 +44687,7 @@ const makeMessageSchema = (role) => z.strictObject({
 const SystemMessageSchema = makeMessageSchema('system');
 const UserMessageSchema = makeMessageSchema('user');
 const BasePromptSchema = z.strictObject({
-    model: z.string(),
+    model: z.optional(z.string()),
     thinkingLevel: z.optional(z.enum(['minimal', 'low', 'medium', 'high'])),
     messages: z.union([
         z.tuple([UserMessageSchema], UserMessageSchema),
@@ -64705,6 +64705,65 @@ function getRetryAfterSeconds(error) {
 
 // GitHub action
 // Copyright © 2026 Alexander Thoukydides
+// List of models and their characteristics (in descending order of capability)
+var ModelType;
+(function (ModelType) {
+    ModelType[ModelType["FlashLite"] = 0] = "FlashLite";
+    ModelType[ModelType["Flash"] = 1] = "Flash";
+    ModelType[ModelType["Pro"] = 2] = "Pro";
+})(ModelType || (ModelType = {}));
+const MODELS = [{
+        model: 'gemini-3-flash-preview',
+        type: ModelType.Flash,
+        thinkingLevel: true
+    }, {
+        model: 'gemini-2.5-flash',
+        type: ModelType.Flash,
+        thinkingLevel: true
+    }, {
+        // Gemini 3.1 Flash Lite allows 500 RPD; all others are 20 RPD
+        model: 'gemini-3.1-flash-lite-preview',
+        type: ModelType.FlashLite,
+        thinkingLevel: false
+    }, {
+        model: 'gemini-2.5-flash-lite',
+        type: ModelType.FlashLite,
+        thinkingLevel: false
+    }];
+// Number of attempts to use the preferred model
+const PREFERRED_MODEL_ATTEMPTS = 3;
+// Update inference parameters with the model for specific try
+function updateModelParams(params, options, attempt) {
+    const { fallback, fallback_lite } = options;
+    // Choose the model for this attempt
+    let modelDetails;
+    if (attempt <= PREFERRED_MODEL_ATTEMPTS || !fallback) {
+        // Use the preferred model
+        modelDetails = MODELS[0];
+        if (params.model) {
+            const found = MODELS.find(m => m.model === params.model);
+            if (found)
+                modelDetails = found;
+            else
+                coreExports.warning(`Requested model '${params.model}' not recognised`);
+        }
+    }
+    else {
+        // Iterate through available models (starting with second choice)
+        const models = fallback_lite ? MODELS : MODELS.filter(m => m.type !== ModelType.FlashLite);
+        const index = (attempt - PREFERRED_MODEL_ATTEMPTS) % models.length;
+        modelDetails = models[index];
+    }
+    // Remove any thinkingLevel configuration if unsupported by the model
+    const thinkingConfig = modelDetails.thinkingLevel ? params.config?.thinkingConfig
+        : { ...params.config?.thinkingConfig, thinkingLevel: undefined };
+    // Return the updated inference parameters for the selected model
+    const { model } = modelDetails;
+    return { ...params, model, config: { ...params.config, thinkingConfig } };
+}
+
+// GitHub action
+// Copyright © 2026 Alexander Thoukydides
 // Retryable errors
 class RetryableError extends Error {
 }
@@ -64716,13 +64775,19 @@ const MIN_RETRY_JITTER_MS = 10_000; // Start with 10 seconds of random jitter
 const MAX_RETRY_JITTER_MS = 5 * 60_000; // Cap jitter at 5 minutes
 const RETRY_JITTER_FACTOR = 1.5; // Exponential backoff factor for jitter
 // Perform an inference request
-async function geminiInference(apiKey, params, maxRetries, maxElapsedMinutes) {
+async function geminiInference(params, options) {
+    const { gemini_api_key, max_retries, max_elapsed_minutes, fallback, fallback_lite } = options;
+    const ai = new GoogleGenAI({ apiKey: gemini_api_key });
     const startTime = Date.now();
     let retryCount = 0;
     for (let attempt = 1;; attempt++) {
         try {
+            // Check whether a fallback model should be used
+            const modelOptions = { fallback, fallback_lite };
+            const attemptParams = updateModelParams(params, modelOptions, attempt);
+            coreExports.info(`Inference attempt #${attempt} using model '${attemptParams.model}'`);
             // Attempt inference and return if successful
-            const result = await attemptInference(apiKey, params);
+            const result = await attemptInference(ai, attemptParams);
             coreExports.info(`Inference attempt #${attempt} successful`);
             return result;
         }
@@ -64754,23 +64819,22 @@ async function geminiInference(apiKey, params, maxRetries, maxElapsedMinutes) {
                 throw new Error(`Inference failed with non-retryable error: ${message}`);
             }
             // Check whether the retry limits have been exceeded
-            if (maxRetries <= retryCount) {
+            if (max_retries <= retryCount) {
                 throw new Error(`Inference failed after ${plural(retryCount, 'retry')}: ${message}`);
             }
-            else if (startTime + maxElapsedMinutes * 60_000 < Date.now() + retryDelay) {
+            else if (startTime + max_elapsed_minutes * 60_000 < Date.now() + retryDelay) {
                 throw new Error(`Inference failed after ${formatMilliseconds(Date.now() - startTime)} elapsed: ${message}`);
             }
             // Log the retryable error and retry after a delay
             coreExports.info(`Inference attempt #${attempt} failed: ${message}`);
-            coreExports.info(`Trying again in ${formatMilliseconds(retryDelay)} (${retryCount} of ${plural(maxRetries, 'retry')})...`);
+            coreExports.info(`Trying again in ${formatMilliseconds(retryDelay)} (${retryCount} of ${plural(max_retries, 'retry')})...`);
             await promises.setTimeout(retryDelay);
         }
     }
 }
 // Attempt a single inference request
-async function attemptInference(apiKey, params) {
+async function attemptInference(ai, params) {
     // Perform the inference
-    const ai = new GoogleGenAI({ apiKey });
     const result = await ai.models.generateContent(params);
     coreExports.debug(`Raw response:\n${JSON.stringify(result, null, 4)}`);
     // Log the token usage, if available
@@ -64876,6 +64940,8 @@ async function run() {
     const max_tokens = Number(coreExports.getInput('max_tokens', { required: true }));
     const max_retries = Number(coreExports.getInput('max_retries', { required: true }));
     const max_elapsed_minutes = Number(coreExports.getInput('max_elapsed_minutes', { required: true }));
+    const fallback = coreExports.getBooleanInput('fallback', { required: true });
+    const fallback_lite = coreExports.getBooleanInput('fallback_lite', { required: true });
     // Load the prompt file
     const prompt = loadPromptFile(prompt_file);
     // Substitute template variables in the prompt messages
@@ -64889,7 +64955,8 @@ async function run() {
     coreExports.info(JSON.stringify(params, null, 4));
     coreExports.endGroup();
     // Perform the inference
-    const { response, thoughts } = await geminiInference(gemini_api_key, params, max_retries, max_elapsed_minutes);
+    const inferenceOptions = { gemini_api_key, max_retries, max_elapsed_minutes, fallback, fallback_lite };
+    const { response, thoughts } = await geminiInference(params, inferenceOptions);
     // Log the response
     coreExports.startGroup('Inference response');
     if (thoughts)
