@@ -151,7 +151,7 @@ function checkInferenceResult(params: GenerateContentParameters, result: Generat
     }
 
     // Extract the response text and thoughts from the result
-    const response = result.text;
+    let response = result.text;
     const candidate = result.candidates?.[0];
     const thoughts = candidate?.content?.parts?.find(part => part.thought)?.text;
 
@@ -165,8 +165,11 @@ function checkInferenceResult(params: GenerateContentParameters, result: Generat
         const zodSchema = z.fromJSONSchema(schema as JSONSchema.JSONSchema);
         try {
             // A JSON schema was provided, so validate the response against it
-            const json = JSON.parse(response) as unknown;
-            void zodSchema.parse(json); // (validation only; result discarded)
+            const json = parseJSONResponse(response);
+            const parsed = zodSchema.parse(json);
+
+            // Use the possibly modified validated response
+            response = JSON.stringify(parsed, null, 4);
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             throw new RetryableModelError(`Structured response failed validation: ${message}`);
@@ -175,5 +178,19 @@ function checkInferenceResult(params: GenerateContentParameters, result: Generat
 
     // Return the text response
     return { response, thoughts };
+}
 
+// Parse a structured response, patching any known issues
+function parseJSONResponse(response: string): unknown {
+    // Parse as JSON, checking for correctly escaped newlines within strings
+    const status = { anyNewline: false };
+    const json: unknown = JSON.parse(response, (_, value): unknown => {
+        if (typeof value === 'string' && value.includes('\n')) status.anyNewline = true;
+        return value;
+    });
+    if (status.anyNewline) return json;
+
+    // If none found, parse again replacing incorrectly double-escaped newlines
+    return JSON.parse(response, (_, value: unknown) =>
+        typeof value === 'string' ? value.replaceAll(/(?<!\\)\\n/g, '\n') : value);
 }

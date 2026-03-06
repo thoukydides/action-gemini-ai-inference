@@ -64851,7 +64851,7 @@ function checkInferenceResult(params, result) {
             + ` cached=${cachedContentTokenCount})`);
     }
     // Extract the response text and thoughts from the result
-    const response = result.text;
+    let response = result.text;
     const candidate = result.candidates?.[0];
     const thoughts = candidate?.content?.parts?.find(part => part.thought)?.text;
     // Validate the response
@@ -64865,8 +64865,10 @@ function checkInferenceResult(params, result) {
         const zodSchema = z.fromJSONSchema(schema);
         try {
             // A JSON schema was provided, so validate the response against it
-            const json = JSON.parse(response);
-            void zodSchema.parse(json); // (validation only; result discarded)
+            const json = parseJSONResponse(response);
+            const parsed = zodSchema.parse(json);
+            // Use the possibly modified validated response
+            response = JSON.stringify(parsed, null, 4);
         }
         catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -64875,6 +64877,20 @@ function checkInferenceResult(params, result) {
     }
     // Return the text response
     return { response, thoughts };
+}
+// Parse a structured response, patching any known issues
+function parseJSONResponse(response) {
+    // Parse as JSON, checking for correctly escaped newlines within strings
+    const status = { anyNewline: false };
+    const json = JSON.parse(response, (_, value) => {
+        if (typeof value === 'string' && value.includes('\n'))
+            status.anyNewline = true;
+        return value;
+    });
+    if (status.anyNewline)
+        return json;
+    // If none found, parse again replacing incorrectly double-escaped newlines
+    return JSON.parse(response, (_, value) => typeof value === 'string' ? value.replaceAll(/(?<!\\)\\n/g, '\n') : value);
 }
 
 // GitHub action

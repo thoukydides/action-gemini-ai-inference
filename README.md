@@ -8,6 +8,7 @@ The following additional features are implemented:
 - Thinking level defaults to `high`, but can be overridden
 - Model thought summaries are captured, logged, and returned as outputs
 - If structured output is used then the response is validated against the provided schema
+- Incorrectly double-escaped newlines in structured output are fixed
 - Some failures are retried a limited number of times
 - Retries can fallback to less capable models
 
