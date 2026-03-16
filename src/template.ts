@@ -38,9 +38,9 @@ export function parseTemplateVariables(yaml: string): TemplateVariables {
             variables[key] = typeof value === 'string' ? value : JSON.stringify(value);
         }
         return variables;
-    } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`Failed to parse template variables: ${message}`);
+    } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        throw new Error(`Failed to parse template variables: ${message}`, { cause });
     }
 }
 
@@ -54,9 +54,9 @@ export function parseFileTemplateVariables(yaml: string): TemplateVariables {
         // Parse the YAML and ensure that it is an object of string values
         parsed = yamlLoad(yaml);
         if (typeof parsed !== 'object' || parsed === null) throw new Error('Not an object');
-    } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`Failed to parse file template variables: ${message}`);
+    } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        throw new Error(`Failed to parse file template variables: ${message}`, { cause });
     }
 
     // Read the contents of each file and return as an object
@@ -65,9 +65,9 @@ export function parseFileTemplateVariables(yaml: string): TemplateVariables {
         try {
             if (typeof filePath !== 'string') throw new Error('File path is not a string');
             variables[key] = fs.readFileSync(filePath, { encoding: 'utf8' });
-        } catch (err) {
-            const message = err instanceof Error ? err.message : String(err);
-            throw new Error(`Failed to read file template '${key}' from '${filePath}': ${message}`);
+        } catch (cause) {
+            const message = cause instanceof Error ? cause.message : String(cause);
+            throw new Error(`Failed to read file template '${key}' from '${filePath}': ${message}`, { cause });
         }
     }
     return variables;

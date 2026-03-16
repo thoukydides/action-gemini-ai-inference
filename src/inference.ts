@@ -71,27 +71,27 @@ export async function geminiInference(fallbackParams: GenerateContentParameters[
             core.info(`Inference attempt #${attempt} successful`);
             return result;
 
-        } catch (err) {
+        } catch (cause) {
             // Check whether the error is retryable
-            const message = err instanceof Error ? err.message : String(err);
-            if (!(err instanceof RetryableError)) {
-                throw new Error(`Inference failed with non-retryable error: ${message}`);
+            const message = cause instanceof Error ? cause.message : String(cause);
+            if (!(cause instanceof RetryableError)) {
+                throw new Error(`Inference failed with non-retryable error: ${message}`, { cause });
             }
 
             // Use a different model for each retry (after the initial attempts)
             if (PREFERRED_MODEL_ATTEMPTS <= attempt) {
                 const thisParam = fallbackParams.shift();
-                if (thisParam && !err.failModel) fallbackParams.push(thisParam);
+                if (thisParam && !cause.failModel) fallbackParams.push(thisParam);
             }
             if (!fallbackParams.length) {
-                throw new Error(`Inference failed after exhausting all models: ${message}`);
+                throw new Error(`Inference failed after exhausting all models: ${message}`, { cause });
             }
 
             // Select the retry delay
             let retryDelay: number;
-            if (err.retryAfter !== undefined) {
+            if (cause.retryAfter !== undefined) {
                 // Use the delay specified in the error (e.g. from rate limiting)
-                retryDelay = err.retryAfter;
+                retryDelay = cause.retryAfter;
             } else {
                 // Otherwise use exponential backoff with jitter
                 const jitterMultiplier = Math.pow(RETRY_JITTER_FACTOR, attempt - 1);
@@ -100,13 +100,13 @@ export async function geminiInference(fallbackParams: GenerateContentParameters[
             }
 
             // Only count model responses against the retry count
-            if (err instanceof RetryableModelError) ++retryCount;
+            if (cause instanceof RetryableModelError) ++retryCount;
 
             // Check whether any retry limits have been exceeded
             if (max_retries <= retryCount) {
-                throw new Error(`Inference failed after ${plural(retryCount, 'retry')}: ${message}`);
+                throw new Error(`Inference failed after ${plural(retryCount, 'retry')}: ${message}`, { cause });
             } else if (startTime + max_elapsed_minutes * 60_000 < Date.now() + retryDelay) {
-                throw new Error(`Inference failed after ${formatMilliseconds(Date.now() - startTime)} elapsed: ${message}`);
+                throw new Error(`Inference failed after ${formatMilliseconds(Date.now() - startTime)} elapsed: ${message}`, { cause });
             }
 
             // Log the retryable error and retry after a delay

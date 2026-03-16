@@ -9,10 +9,12 @@ const typescript = _typescript as unknown as (options?: RollupTypescriptOptions)
 
 // https://github.com/rollup/rollup/issues/1089
 const onwarn = (warning: RollupLog, defaultHandler: (warning: string | RollupLog) => void): void => {
-    if (warning.code === 'CIRCULAR_DEPENDENCY'
-        && warning.ids?.some(p => p.includes('/node_modules/@actions/core/'))) {
-        // Suppress circular dependency warning for @actions/core
+    const ids = [...(warning.ids ?? []), ...(warning.id ? [warning.id] : [])];
+    if (ids.some(p => p.includes('/node_modules/@actions/') || p.includes('/node_modules/zod/'))
+        && ['CIRCULAR_DEPENDENCY', 'THIS_IS_UNDEFINED'].includes(warning.code ?? '')) {
+        // Suppress undefined this and circular dependency warnings for @actions/* and zod
     } else {
+        console.log(JSON.stringify({ ids, code: warning.code }));
         defaultHandler(warning);
     }
 };

@@ -67,9 +67,9 @@ function prepareResponse(prompt: Prompt): InferenceResponseSchema {
             responseMimeType:   'application/json',
             responseJsonSchema: JSON.parse(prompt.jsonSchema) as unknown
         };
-    } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`Failed to parse JSON schema: ${message}`);
+    } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        throw new Error(`Failed to parse JSON schema: ${message}`, { cause });
     }
 }
 

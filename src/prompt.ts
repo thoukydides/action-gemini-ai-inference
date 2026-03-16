@@ -34,8 +34,8 @@ export function loadPromptFile(filePath: string): Prompt {
     try {
         const yaml = fs.readFileSync(filePath, { encoding: 'utf8' });
         return PromptSchema.parse(yamlLoad(yaml));
-    } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`Failed to load or parse prompt file '${filePath}': ${message}`);
+    } catch (cause) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        throw new Error(`Failed to load or parse prompt file '${filePath}': ${message}`, { cause });
     }
 }
