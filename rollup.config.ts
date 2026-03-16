@@ -13,10 +13,9 @@ const IGNORE_WARNINGS: Record<string, string[]> = {
     THIS_IS_UNDEFINED:   ['@actions']
 };
 const onwarn = (warning: RollupLog, defaultHandler: (warning: string | RollupLog) => void): void => {
-    const idIncludes = (s: string): boolean =>
-        Boolean(warning.id?.includes(s)) || Boolean(warning.ids?.some(id => id.includes(s)));
-    if (IGNORE_WARNINGS[warning.code ?? '']?.some(module => idIncludes(`/node_modules/${module}/`))) return;
-    defaultHandler(warning);
+    const includesModule = (module: string): boolean =>
+        [...warning.ids ?? [], warning.id].some(id => id?.includes(`/node_modules/${module}/`));
+    if (!IGNORE_WARNINGS[warning.code ?? '']?.some(includesModule)) defaultHandler(warning);
 };
 
 const config: RollupOptions = {
