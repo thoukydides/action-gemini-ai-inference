@@ -2737,15 +2737,23 @@ function requireDispatcherBase () {
 	const kOnDestroyed = Symbol('onDestroyed');
 	const kOnClosed = Symbol('onClosed');
 	const kInterceptedDispatch = Symbol('Intercepted Dispatch');
+	const kWebSocketOptions = Symbol('webSocketOptions');
 
 	class DispatcherBase extends Dispatcher {
-	  constructor () {
+	  constructor (opts) {
 	    super();
 
 	    this[kDestroyed] = false;
 	    this[kOnDestroyed] = null;
 	    this[kClosed] = false;
 	    this[kOnClosed] = [];
+	    this[kWebSocketOptions] = opts?.webSocket ?? {};
+	  }
+
+	  get webSocketOptions () {
+	    return {
+	      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
+	    }
 	  }
 
 	  get destroyed () {
@@ -11123,9 +11131,10 @@ function requireClient () {
 	    autoSelectFamilyAttemptTimeout,
 	    // h2
 	    maxConcurrentStreams,
-	    allowH2
+	    allowH2,
+	    webSocket
 	  } = {}) {
-	    super();
+	    super({ webSocket });
 
 	    if (keepAlive !== undefined) {
 	      throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -11832,8 +11841,8 @@ function requirePoolBase () {
 	const kStats = Symbol('stats');
 
 	class PoolBase extends DispatcherBase {
-	  constructor () {
-	    super();
+	  constructor (opts) {
+	    super(opts);
 
 	    this[kQueue] = new FixedQueue();
 	    this[kClients] = [];
@@ -12052,8 +12061,6 @@ function requirePool () {
 	    allowH2,
 	    ...options
 	  } = {}) {
-	    super();
-
 	    if (connections != null && (!Number.isFinite(connections) || connections < 0)) {
 	      throw new InvalidArgumentError('invalid connections')
 	    }
@@ -12077,6 +12084,8 @@ function requirePool () {
 	        ...connect
 	      });
 	    }
+
+	    super(options);
 
 	    this[kInterceptors] = options.interceptors?.Pool && Array.isArray(options.interceptors.Pool)
 	      ? options.interceptors.Pool
@@ -12371,7 +12380,6 @@ function requireAgent () {
 
 	class Agent extends DispatcherBase {
 	  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
-	    super();
 
 	    if (typeof factory !== 'function') {
 	      throw new InvalidArgumentError('factory must be a function.')
@@ -12384,6 +12392,8 @@ function requireAgent () {
 	    if (!Number.isInteger(maxRedirections) || maxRedirections < 0) {
 	      throw new InvalidArgumentError('maxRedirections must be a positive number')
 	    }
+
+	    super(options);
 
 	    if (connect && typeof connect !== 'function') {
 	      connect = { ...connect };
@@ -25525,40 +25535,35 @@ function requirePermessageDeflate () {
 	const kBuffer = Symbol('kBuffer');
 	const kLength = Symbol('kLength');
 
-	// Default maximum decompressed message size: 4 MB
-	const kDefaultMaxDecompressedSize = 4 * 1024 * 1024;
-
 	class PerMessageDeflate {
 	  /** @type {import('node:zlib').InflateRaw} */
 	  #inflate
 
 	  #options = {}
 
-	  /** @type {boolean} */
-	  #aborted = false
-
-	  /** @type {Function|null} */
-	  #currentCallback = null
+	  #maxPayloadSize = 0
 
 	  /**
 	   * @param {Map<string, string>} extensions
 	   */
-	  constructor (extensions) {
+	  constructor (extensions, options) {
 	    this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover');
 	    this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits');
+
+	    this.#maxPayloadSize = options.maxPayloadSize;
 	  }
 
+	  /**
+	   * Decompress a compressed payload.
+	   * @param {Buffer} chunk Compressed data
+	   * @param {boolean} fin Final fragment flag
+	   * @param {Function} callback Callback function
+	   */
 	  decompress (chunk, fin, callback) {
 	    // An endpoint uses the following algorithm to decompress a message.
 	    // 1.  Append 4 octets of 0x00 0x00 0xff 0xff to the tail end of the
 	    //     payload of the message.
 	    // 2.  Decompress the resulting data using DEFLATE.
-
-	    if (this.#aborted) {
-	      callback(new MessageSizeExceededError());
-	      return
-	    }
-
 	    if (!this.#inflate) {
 	      let windowBits = Z_DEFAULT_WINDOWBITS;
 
@@ -25581,23 +25586,12 @@ function requirePermessageDeflate () {
 	      this.#inflate[kLength] = 0;
 
 	      this.#inflate.on('data', (data) => {
-	        if (this.#aborted) {
-	          return
-	        }
-
 	        this.#inflate[kLength] += data.length;
 
-	        if (this.#inflate[kLength] > kDefaultMaxDecompressedSize) {
-	          this.#aborted = true;
+	        if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
+	          callback(new MessageSizeExceededError());
 	          this.#inflate.removeAllListeners();
-	          this.#inflate.destroy();
 	          this.#inflate = null;
-
-	          if (this.#currentCallback) {
-	            const cb = this.#currentCallback;
-	            this.#currentCallback = null;
-	            cb(new MessageSizeExceededError());
-	          }
 	          return
 	        }
 
@@ -25610,14 +25604,13 @@ function requirePermessageDeflate () {
 	      });
 	    }
 
-	    this.#currentCallback = callback;
 	    this.#inflate.write(chunk);
 	    if (fin) {
 	      this.#inflate.write(tail);
 	    }
 
 	    this.#inflate.flush(() => {
-	      if (this.#aborted || !this.#inflate) {
+	      if (!this.#inflate) {
 	        return
 	      }
 
@@ -25625,7 +25618,6 @@ function requirePermessageDeflate () {
 
 	      this.#inflate[kBuffer].length = 0;
 	      this.#inflate[kLength] = 0;
-	      this.#currentCallback = null;
 
 	      callback(null, full);
 	    });
@@ -25661,6 +25653,7 @@ function requireReceiver () {
 	const { WebsocketFrameSend } = requireFrame();
 	const { closeWebSocketConnection } = requireConnection();
 	const { PerMessageDeflate } = requirePermessageDeflate();
+	const { MessageSizeExceededError } = requireErrors();
 
 	// This code was influenced by ws released under the MIT license.
 	// Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
@@ -25669,6 +25662,7 @@ function requireReceiver () {
 
 	class ByteParser extends Writable {
 	  #buffers = []
+	  #fragmentsBytes = 0
 	  #byteOffset = 0
 	  #loop = false
 
@@ -25680,18 +25674,23 @@ function requireReceiver () {
 	  /** @type {Map<string, PerMessageDeflate>} */
 	  #extensions
 
+	  /** @type {number} */
+	  #maxPayloadSize
+
 	  /**
 	   * @param {import('./websocket').WebSocket} ws
 	   * @param {Map<string, string>|null} extensions
+	   * @param {{ maxPayloadSize?: number }} [options]
 	   */
-	  constructor (ws, extensions) {
+	  constructor (ws, extensions, options = {}) {
 	    super();
 
 	    this.ws = ws;
 	    this.#extensions = extensions == null ? new Map() : extensions;
+	    this.#maxPayloadSize = options.maxPayloadSize ?? 0;
 
 	    if (this.#extensions.has('permessage-deflate')) {
-	      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions));
+	      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options));
 	    }
 	  }
 
@@ -25705,6 +25704,19 @@ function requireReceiver () {
 	    this.#loop = true;
 
 	    this.run(callback);
+	  }
+
+	  #validatePayloadLength () {
+	    if (
+	      this.#maxPayloadSize > 0 &&
+	      !isControlFrame(this.#info.opcode) &&
+	      this.#info.payloadLength > this.#maxPayloadSize
+	    ) {
+	      failWebsocketConnection(this.ws, 'Payload size exceeds maximum allowed size');
+	      return false
+	    }
+
+	    return true
 	  }
 
 	  /**
@@ -25795,6 +25807,10 @@ function requireReceiver () {
 	        if (payloadLength <= 125) {
 	          this.#info.payloadLength = payloadLength;
 	          this.#state = parserStates.READ_DATA;
+
+	          if (!this.#validatePayloadLength()) {
+	            return
+	          }
 	        } else if (payloadLength === 126) {
 	          this.#state = parserStates.PAYLOADLENGTH_16;
 	        } else if (payloadLength === 127) {
@@ -25819,6 +25835,10 @@ function requireReceiver () {
 
 	        this.#info.payloadLength = buffer.readUInt16BE(0);
 	        this.#state = parserStates.READ_DATA;
+
+	        if (!this.#validatePayloadLength()) {
+	          return
+	        }
 	      } else if (this.#state === parserStates.PAYLOADLENGTH_64) {
 	        if (this.#byteOffset < 8) {
 	          return callback()
@@ -25841,6 +25861,10 @@ function requireReceiver () {
 
 	        this.#info.payloadLength = lower;
 	        this.#state = parserStates.READ_DATA;
+
+	        if (!this.#validatePayloadLength()) {
+	          return
+	        }
 	      } else if (this.#state === parserStates.READ_DATA) {
 	        if (this.#byteOffset < this.#info.payloadLength) {
 	          return callback()
@@ -25853,42 +25877,53 @@ function requireReceiver () {
 	          this.#state = parserStates.INFO;
 	        } else {
 	          if (!this.#info.compressed) {
-	            this.#fragments.push(body);
+	            this.writeFragments(body);
+
+	            if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
+	              failWebsocketConnection(this.ws, new MessageSizeExceededError().message);
+	              return
+	            }
 
 	            // If the frame is not fragmented, a message has been received.
 	            // If the frame is fragmented, it will terminate with a fin bit set
 	            // and an opcode of 0 (continuation), therefore we handle that when
 	            // parsing continuation frames, not here.
 	            if (!this.#info.fragmented && this.#info.fin) {
-	              const fullMessage = Buffer.concat(this.#fragments);
-	              websocketMessageReceived(this.ws, this.#info.binaryType, fullMessage);
-	              this.#fragments.length = 0;
+	              websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments());
 	            }
 
 	            this.#state = parserStates.INFO;
 	          } else {
-	            this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
-	              if (error) {
-	                failWebsocketConnection(this.ws, error.message);
-	                return
-	              }
+	            this.#extensions.get('permessage-deflate').decompress(
+	              body,
+	              this.#info.fin,
+	              (error, data) => {
+	                if (error) {
+	                  failWebsocketConnection(this.ws, error.message);
+	                  return
+	                }
 
-	              this.#fragments.push(data);
+	                this.writeFragments(data);
 
-	              if (!this.#info.fin) {
-	                this.#state = parserStates.INFO;
+	                if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
+	                  failWebsocketConnection(this.ws, new MessageSizeExceededError().message);
+	                  return
+	                }
+
+	                if (!this.#info.fin) {
+	                  this.#state = parserStates.INFO;
+	                  this.#loop = true;
+	                  this.run(callback);
+	                  return
+	                }
+
+	                websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments());
+
 	                this.#loop = true;
+	                this.#state = parserStates.INFO;
 	                this.run(callback);
-	                return
 	              }
-
-	              websocketMessageReceived(this.ws, this.#info.binaryType, Buffer.concat(this.#fragments));
-
-	              this.#loop = true;
-	              this.#state = parserStates.INFO;
-	              this.#fragments.length = 0;
-	              this.run(callback);
-	            });
+	            );
 
 	            this.#loop = false;
 	            break
@@ -25938,6 +25973,26 @@ function requireReceiver () {
 	    this.#byteOffset -= n;
 
 	    return buffer
+	  }
+
+	  writeFragments (fragment) {
+	    this.#fragmentsBytes += fragment.length;
+	    this.#fragments.push(fragment);
+	  }
+
+	  consumeFragments () {
+	    const fragments = this.#fragments;
+
+	    if (fragments.length === 1) {
+	      this.#fragmentsBytes = 0;
+	      return fragments.shift()
+	    }
+
+	    const output = Buffer.concat(fragments, this.#fragmentsBytes);
+	    this.#fragments = [];
+	    this.#fragmentsBytes = 0;
+
+	    return output
 	  }
 
 	  parseCloseBody (data) {
@@ -26625,7 +26680,11 @@ function requireWebsocket () {
 	    // once this happens, the connection is open
 	    this[kResponse] = response;
 
-	    const parser = new ByteParser(this, parsedExtensions);
+	    const maxPayloadSize = this[kController]?.dispatcher?.webSocketOptions?.maxPayloadSize;
+
+	    const parser = new ByteParser(this, parsedExtensions, {
+	      maxPayloadSize
+	    });
 	    parser.on('drain', onParserDrain);
 	    parser.on('error', onParserError.bind(this));
 
@@ -46382,6 +46441,18 @@ function videoFromVertex$1(fromObject) {
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: Apache-2.0
  */
+/** Programming language of the `code`. */
+var Language;
+(function (Language) {
+    /**
+     * Unspecified language. This value should not be used.
+     */
+    Language["LANGUAGE_UNSPECIFIED"] = "LANGUAGE_UNSPECIFIED";
+    /**
+     * Python >= 3.10, with numpy and simpy available.
+     */
+    Language["PYTHON"] = "PYTHON";
+})(Language || (Language = {}));
 /** Outcome of the code execution. */
 var Outcome;
 (function (Outcome) {
@@ -46402,18 +46473,6 @@ var Outcome;
      */
     Outcome["OUTCOME_DEADLINE_EXCEEDED"] = "OUTCOME_DEADLINE_EXCEEDED";
 })(Outcome || (Outcome = {}));
-/** Programming language of the `code`. */
-var Language;
-(function (Language) {
-    /**
-     * Unspecified language. This value should not be used.
-     */
-    Language["LANGUAGE_UNSPECIFIED"] = "LANGUAGE_UNSPECIFIED";
-    /**
-     * Python >= 3.10, with numpy and simpy available.
-     */
-    Language["PYTHON"] = "PYTHON";
-})(Language || (Language = {}));
 /** Specifies how the response should be scheduled in the conversation. */
 var FunctionResponseScheduling;
 (function (FunctionResponseScheduling) {
@@ -46470,38 +46529,18 @@ var Type;
      */
     Type["NULL"] = "NULL";
 })(Type || (Type = {}));
-/** Sites with confidence level chosen & above this value will be blocked from the search results. This enum is not supported in Gemini API. */
-var PhishBlockThreshold;
-(function (PhishBlockThreshold) {
+/** The environment being operated. */
+var Environment;
+(function (Environment) {
     /**
-     * Defaults to unspecified.
+     * Defaults to browser.
      */
-    PhishBlockThreshold["PHISH_BLOCK_THRESHOLD_UNSPECIFIED"] = "PHISH_BLOCK_THRESHOLD_UNSPECIFIED";
+    Environment["ENVIRONMENT_UNSPECIFIED"] = "ENVIRONMENT_UNSPECIFIED";
     /**
-     * Blocks Low and above confidence URL that is risky.
+     * Operates in a web browser.
      */
-    PhishBlockThreshold["BLOCK_LOW_AND_ABOVE"] = "BLOCK_LOW_AND_ABOVE";
-    /**
-     * Blocks Medium and above confidence URL that is risky.
-     */
-    PhishBlockThreshold["BLOCK_MEDIUM_AND_ABOVE"] = "BLOCK_MEDIUM_AND_ABOVE";
-    /**
-     * Blocks High and above confidence URL that is risky.
-     */
-    PhishBlockThreshold["BLOCK_HIGH_AND_ABOVE"] = "BLOCK_HIGH_AND_ABOVE";
-    /**
-     * Blocks Higher and above confidence URL that is risky.
-     */
-    PhishBlockThreshold["BLOCK_HIGHER_AND_ABOVE"] = "BLOCK_HIGHER_AND_ABOVE";
-    /**
-     * Blocks Very high and above confidence URL that is risky.
-     */
-    PhishBlockThreshold["BLOCK_VERY_HIGH_AND_ABOVE"] = "BLOCK_VERY_HIGH_AND_ABOVE";
-    /**
-     * Blocks Extremely high confidence URL that is risky.
-     */
-    PhishBlockThreshold["BLOCK_ONLY_EXTREMELY_HIGH"] = "BLOCK_ONLY_EXTREMELY_HIGH";
-})(PhishBlockThreshold || (PhishBlockThreshold = {}));
+    Environment["ENVIRONMENT_BROWSER"] = "ENVIRONMENT_BROWSER";
+})(Environment || (Environment = {}));
 /** Type of auth scheme. This enum is not supported in Gemini API. */
 var AuthType;
 (function (AuthType) {
@@ -46572,6 +46611,38 @@ var ApiSpec;
      */
     ApiSpec["ELASTIC_SEARCH"] = "ELASTIC_SEARCH";
 })(ApiSpec || (ApiSpec = {}));
+/** Sites with confidence level chosen & above this value will be blocked from the search results. This enum is not supported in Gemini API. */
+var PhishBlockThreshold;
+(function (PhishBlockThreshold) {
+    /**
+     * Defaults to unspecified.
+     */
+    PhishBlockThreshold["PHISH_BLOCK_THRESHOLD_UNSPECIFIED"] = "PHISH_BLOCK_THRESHOLD_UNSPECIFIED";
+    /**
+     * Blocks Low and above confidence URL that is risky.
+     */
+    PhishBlockThreshold["BLOCK_LOW_AND_ABOVE"] = "BLOCK_LOW_AND_ABOVE";
+    /**
+     * Blocks Medium and above confidence URL that is risky.
+     */
+    PhishBlockThreshold["BLOCK_MEDIUM_AND_ABOVE"] = "BLOCK_MEDIUM_AND_ABOVE";
+    /**
+     * Blocks High and above confidence URL that is risky.
+     */
+    PhishBlockThreshold["BLOCK_HIGH_AND_ABOVE"] = "BLOCK_HIGH_AND_ABOVE";
+    /**
+     * Blocks Higher and above confidence URL that is risky.
+     */
+    PhishBlockThreshold["BLOCK_HIGHER_AND_ABOVE"] = "BLOCK_HIGHER_AND_ABOVE";
+    /**
+     * Blocks Very high and above confidence URL that is risky.
+     */
+    PhishBlockThreshold["BLOCK_VERY_HIGH_AND_ABOVE"] = "BLOCK_VERY_HIGH_AND_ABOVE";
+    /**
+     * Blocks Extremely high confidence URL that is risky.
+     */
+    PhishBlockThreshold["BLOCK_ONLY_EXTREMELY_HIGH"] = "BLOCK_ONLY_EXTREMELY_HIGH";
+})(PhishBlockThreshold || (PhishBlockThreshold = {}));
 /** Specifies the function Behavior. Currently only supported by the BidiGenerateContent method. This enum is not supported in Vertex AI. */
 var Behavior;
 (function (Behavior) {
@@ -46632,6 +46703,10 @@ var ThinkingLevel;
      */
     ThinkingLevel["THINKING_LEVEL_UNSPECIFIED"] = "THINKING_LEVEL_UNSPECIFIED";
     /**
+     * MINIMAL thinking level.
+     */
+    ThinkingLevel["MINIMAL"] = "MINIMAL";
+    /**
      * Low thinking level.
      */
     ThinkingLevel["LOW"] = "LOW";
@@ -46643,10 +46718,6 @@ var ThinkingLevel;
      * High thinking level.
      */
     ThinkingLevel["HIGH"] = "HIGH";
-    /**
-     * MINIMAL thinking level.
-     */
-    ThinkingLevel["MINIMAL"] = "MINIMAL";
 })(ThinkingLevel || (ThinkingLevel = {}));
 /** Enum that controls the generation of people. */
 var PersonGeneration;
@@ -46664,6 +46735,22 @@ var PersonGeneration;
      */
     PersonGeneration["ALLOW_ALL"] = "ALLOW_ALL";
 })(PersonGeneration || (PersonGeneration = {}));
+/** Controls whether prominent people (celebrities) generation is allowed. If used with personGeneration, personGeneration enum would take precedence. For instance, if ALLOW_NONE is set, all person generation would be blocked. If this field is unspecified, the default behavior is to allow prominent people. This enum is not supported in Gemini API. */
+var ProminentPeople;
+(function (ProminentPeople) {
+    /**
+     * Unspecified value. The model will proceed with the default behavior, which is to allow generation of prominent people.
+     */
+    ProminentPeople["PROMINENT_PEOPLE_UNSPECIFIED"] = "PROMINENT_PEOPLE_UNSPECIFIED";
+    /**
+     * Allows the model to generate images of prominent people.
+     */
+    ProminentPeople["ALLOW_PROMINENT_PEOPLE"] = "ALLOW_PROMINENT_PEOPLE";
+    /**
+     * Prevents the model from generating images of prominent people.
+     */
+    ProminentPeople["BLOCK_PROMINENT_PEOPLE"] = "BLOCK_PROMINENT_PEOPLE";
+})(ProminentPeople || (ProminentPeople = {}));
 /** The harm category to be blocked. */
 var HarmCategory;
 (function (HarmCategory) {
@@ -46981,7 +47068,47 @@ var Modality;
      * Indicates the model should return audio.
      */
     Modality["AUDIO"] = "AUDIO";
+    /**
+     * Indicates the model should return video.
+     */
+    Modality["VIDEO"] = "VIDEO";
 })(Modality || (Modality = {}));
+/** The stage of the underlying model. This enum is not supported in Vertex AI. */
+var ModelStage;
+(function (ModelStage) {
+    /**
+     * Unspecified model stage.
+     */
+    ModelStage["MODEL_STAGE_UNSPECIFIED"] = "MODEL_STAGE_UNSPECIFIED";
+    /**
+     * The underlying model is subject to lots of tunings.
+     */
+    ModelStage["UNSTABLE_EXPERIMENTAL"] = "UNSTABLE_EXPERIMENTAL";
+    /**
+     * Models in this stage are for experimental purposes only.
+     */
+    ModelStage["EXPERIMENTAL"] = "EXPERIMENTAL";
+    /**
+     * Models in this stage are more mature than experimental models.
+     */
+    ModelStage["PREVIEW"] = "PREVIEW";
+    /**
+     * Models in this stage are considered stable and ready for production use.
+     */
+    ModelStage["STABLE"] = "STABLE";
+    /**
+     * If the model is on this stage, it means that this model is on the path to deprecation in near future. Only existing customers can use this model.
+     */
+    ModelStage["LEGACY"] = "LEGACY";
+    /**
+     * Models in this stage are deprecated. These models cannot be used.
+     */
+    ModelStage["DEPRECATED"] = "DEPRECATED";
+    /**
+     * Models in this stage are retired. These models cannot be used.
+     */
+    ModelStage["RETIRED"] = "RETIRED";
+})(ModelStage || (ModelStage = {}));
 /** The media resolution to use. */
 var MediaResolution;
 (function (MediaResolution) {
@@ -47218,6 +47345,26 @@ var TuningTask;
      */
     TuningTask["TUNING_TASK_R2V"] = "TUNING_TASK_R2V";
 })(TuningTask || (TuningTask = {}));
+/** Output only. Current state of the `Document`. This enum is not supported in Vertex AI. */
+var DocumentState;
+(function (DocumentState) {
+    /**
+     * The default value. This value is used if the state is omitted.
+     */
+    DocumentState["STATE_UNSPECIFIED"] = "STATE_UNSPECIFIED";
+    /**
+     * Some `Chunks` of the `Document` are being processed (embedding and vector storage).
+     */
+    DocumentState["STATE_PENDING"] = "STATE_PENDING";
+    /**
+     * All `Chunks` of the `Document` is processed and available for querying.
+     */
+    DocumentState["STATE_ACTIVE"] = "STATE_ACTIVE";
+    /**
+     * Some `Chunks` of the `Document` failed processing.
+     */
+    DocumentState["STATE_FAILED"] = "STATE_FAILED";
+})(DocumentState || (DocumentState = {}));
 /** The tokenization quality used for given media. */
 var PartMediaResolutionLevel;
 (function (PartMediaResolutionLevel) {
@@ -47242,6 +47389,34 @@ var PartMediaResolutionLevel;
      */
     PartMediaResolutionLevel["MEDIA_RESOLUTION_ULTRA_HIGH"] = "MEDIA_RESOLUTION_ULTRA_HIGH";
 })(PartMediaResolutionLevel || (PartMediaResolutionLevel = {}));
+/** The type of tool in the function call. */
+var ToolType;
+(function (ToolType) {
+    /**
+     * Unspecified tool type.
+     */
+    ToolType["TOOL_TYPE_UNSPECIFIED"] = "TOOL_TYPE_UNSPECIFIED";
+    /**
+     * Google search tool, maps to Tool.google_search.search_types.web_search.
+     */
+    ToolType["GOOGLE_SEARCH_WEB"] = "GOOGLE_SEARCH_WEB";
+    /**
+     * Image search tool, maps to Tool.google_search.search_types.image_search.
+     */
+    ToolType["GOOGLE_SEARCH_IMAGE"] = "GOOGLE_SEARCH_IMAGE";
+    /**
+     * URL context tool, maps to Tool.url_context.
+     */
+    ToolType["URL_CONTEXT"] = "URL_CONTEXT";
+    /**
+     * Google maps tool, maps to Tool.google_maps.
+     */
+    ToolType["GOOGLE_MAPS"] = "GOOGLE_MAPS";
+    /**
+     * File search tool, maps to Tool.file_search.
+     */
+    ToolType["FILE_SEARCH"] = "FILE_SEARCH";
+})(ToolType || (ToolType = {}));
 /** Resource scope. */
 var ResourceScope;
 (function (ResourceScope) {
@@ -47254,6 +47429,26 @@ var ResourceScope;
      */
     ResourceScope["COLLECTION"] = "COLLECTION";
 })(ResourceScope || (ResourceScope = {}));
+/** Pricing and performance service tier. */
+var ServiceTier;
+(function (ServiceTier) {
+    /**
+     * Default service tier, which is standard.
+     */
+    ServiceTier["UNSPECIFIED"] = "unspecified";
+    /**
+     * Flex service tier.
+     */
+    ServiceTier["FLEX"] = "flex";
+    /**
+     * Standard service tier.
+     */
+    ServiceTier["STANDARD"] = "standard";
+    /**
+     * Priority service tier.
+     */
+    ServiceTier["PRIORITY"] = "priority";
+})(ServiceTier || (ServiceTier = {}));
 /** Options for feature selection preference. */
 var FeatureSelectionPreference;
 (function (FeatureSelectionPreference) {
@@ -47262,34 +47457,6 @@ var FeatureSelectionPreference;
     FeatureSelectionPreference["BALANCED"] = "BALANCED";
     FeatureSelectionPreference["PRIORITIZE_COST"] = "PRIORITIZE_COST";
 })(FeatureSelectionPreference || (FeatureSelectionPreference = {}));
-/** The environment being operated. */
-var Environment;
-(function (Environment) {
-    /**
-     * Defaults to browser.
-     */
-    Environment["ENVIRONMENT_UNSPECIFIED"] = "ENVIRONMENT_UNSPECIFIED";
-    /**
-     * Operates in a web browser.
-     */
-    Environment["ENVIRONMENT_BROWSER"] = "ENVIRONMENT_BROWSER";
-})(Environment || (Environment = {}));
-/** Enum for controlling whether the model can generate images of prominent people (celebrities). */
-var ProminentPeople;
-(function (ProminentPeople) {
-    /**
-     * Unspecified value. The model will proceed with the default behavior, which is to allow generation of prominent people.
-     */
-    ProminentPeople["PROMINENT_PEOPLE_UNSPECIFIED"] = "PROMINENT_PEOPLE_UNSPECIFIED";
-    /**
-     * Allows the model to generate images of prominent people.
-     */
-    ProminentPeople["ALLOW_PROMINENT_PEOPLE"] = "ALLOW_PROMINENT_PEOPLE";
-    /**
-     * Prevents the model from generating images of prominent people.
-     */
-    ProminentPeople["BLOCK_PROMINENT_PEOPLE"] = "BLOCK_PROMINENT_PEOPLE";
-})(ProminentPeople || (ProminentPeople = {}));
 /** Enum representing the Vertex embedding API to use. */
 var EmbeddingApiType;
 (function (EmbeddingApiType) {
@@ -47464,14 +47631,6 @@ var TuningMethod;
      */
     TuningMethod["DISTILLATION"] = "DISTILLATION";
 })(TuningMethod || (TuningMethod = {}));
-/** State for the lifecycle of a Document. */
-var DocumentState;
-(function (DocumentState) {
-    DocumentState["STATE_UNSPECIFIED"] = "STATE_UNSPECIFIED";
-    DocumentState["STATE_PENDING"] = "STATE_PENDING";
-    DocumentState["STATE_ACTIVE"] = "STATE_ACTIVE";
-    DocumentState["STATE_FAILED"] = "STATE_FAILED";
-})(DocumentState || (DocumentState = {}));
 /** State for the lifecycle of a File. */
 var FileState;
 (function (FileState) {
@@ -47507,6 +47666,102 @@ var TurnCompleteReason;
      * Needs more input from the user.
      */
     TurnCompleteReason["NEED_MORE_INPUT"] = "NEED_MORE_INPUT";
+    /**
+     * Input content is prohibited.
+     */
+    TurnCompleteReason["PROHIBITED_INPUT_CONTENT"] = "PROHIBITED_INPUT_CONTENT";
+    /**
+     * Input image contains prohibited content.
+     */
+    TurnCompleteReason["IMAGE_PROHIBITED_INPUT_CONTENT"] = "IMAGE_PROHIBITED_INPUT_CONTENT";
+    /**
+     * Input text contains prominent person reference.
+     */
+    TurnCompleteReason["INPUT_TEXT_CONTAIN_PROMINENT_PERSON_PROHIBITED"] = "INPUT_TEXT_CONTAIN_PROMINENT_PERSON_PROHIBITED";
+    /**
+     * Input image contains celebrity.
+     */
+    TurnCompleteReason["INPUT_IMAGE_CELEBRITY"] = "INPUT_IMAGE_CELEBRITY";
+    /**
+     * Input image contains photo realistic child.
+     */
+    TurnCompleteReason["INPUT_IMAGE_PHOTO_REALISTIC_CHILD_PROHIBITED"] = "INPUT_IMAGE_PHOTO_REALISTIC_CHILD_PROHIBITED";
+    /**
+     * Input text contains NCII content.
+     */
+    TurnCompleteReason["INPUT_TEXT_NCII_PROHIBITED"] = "INPUT_TEXT_NCII_PROHIBITED";
+    /**
+     * Other input safety issue.
+     */
+    TurnCompleteReason["INPUT_OTHER"] = "INPUT_OTHER";
+    /**
+     * Input contains IP violation.
+     */
+    TurnCompleteReason["INPUT_IP_PROHIBITED"] = "INPUT_IP_PROHIBITED";
+    /**
+     * Input matched blocklist.
+     */
+    TurnCompleteReason["BLOCKLIST"] = "BLOCKLIST";
+    /**
+     * Input is unsafe for image generation.
+     */
+    TurnCompleteReason["UNSAFE_PROMPT_FOR_IMAGE_GENERATION"] = "UNSAFE_PROMPT_FOR_IMAGE_GENERATION";
+    /**
+     * Generated image failed safety check.
+     */
+    TurnCompleteReason["GENERATED_IMAGE_SAFETY"] = "GENERATED_IMAGE_SAFETY";
+    /**
+     * Generated content failed safety check.
+     */
+    TurnCompleteReason["GENERATED_CONTENT_SAFETY"] = "GENERATED_CONTENT_SAFETY";
+    /**
+     * Generated audio failed safety check.
+     */
+    TurnCompleteReason["GENERATED_AUDIO_SAFETY"] = "GENERATED_AUDIO_SAFETY";
+    /**
+     * Generated video failed safety check.
+     */
+    TurnCompleteReason["GENERATED_VIDEO_SAFETY"] = "GENERATED_VIDEO_SAFETY";
+    /**
+     * Generated content is prohibited.
+     */
+    TurnCompleteReason["GENERATED_CONTENT_PROHIBITED"] = "GENERATED_CONTENT_PROHIBITED";
+    /**
+     * Generated content matched blocklist.
+     */
+    TurnCompleteReason["GENERATED_CONTENT_BLOCKLIST"] = "GENERATED_CONTENT_BLOCKLIST";
+    /**
+     * Generated image is prohibited.
+     */
+    TurnCompleteReason["GENERATED_IMAGE_PROHIBITED"] = "GENERATED_IMAGE_PROHIBITED";
+    /**
+     * Generated image contains celebrity.
+     */
+    TurnCompleteReason["GENERATED_IMAGE_CELEBRITY"] = "GENERATED_IMAGE_CELEBRITY";
+    /**
+     * Generated image contains prominent people detected by rewriter.
+     */
+    TurnCompleteReason["GENERATED_IMAGE_PROMINENT_PEOPLE_DETECTED_BY_REWRITER"] = "GENERATED_IMAGE_PROMINENT_PEOPLE_DETECTED_BY_REWRITER";
+    /**
+     * Generated image contains identifiable people.
+     */
+    TurnCompleteReason["GENERATED_IMAGE_IDENTIFIABLE_PEOPLE"] = "GENERATED_IMAGE_IDENTIFIABLE_PEOPLE";
+    /**
+     * Generated image contains minors.
+     */
+    TurnCompleteReason["GENERATED_IMAGE_MINORS"] = "GENERATED_IMAGE_MINORS";
+    /**
+     * Generated image contains IP violation.
+     */
+    TurnCompleteReason["OUTPUT_IMAGE_IP_PROHIBITED"] = "OUTPUT_IMAGE_IP_PROHIBITED";
+    /**
+     * Other generated content issue.
+     */
+    TurnCompleteReason["GENERATED_OTHER"] = "GENERATED_OTHER";
+    /**
+     * Max regeneration attempts reached.
+     */
+    TurnCompleteReason["MAX_REGENERATION_REACHED"] = "MAX_REGENERATION_REACHED";
 })(TurnCompleteReason || (TurnCompleteReason = {}));
 /** Server content modalities. */
 var MediaModality;
@@ -47631,6 +47886,10 @@ var TurnCoverage;
      * The users turn includes all realtime input since the last turn, including inactivity (e.g. silence on the audio stream).
      */
     TurnCoverage["TURN_INCLUDES_ALL_INPUT"] = "TURN_INCLUDES_ALL_INPUT";
+    /**
+     * Includes audio activity and all video since the last turn. With automatic activity detection, audio activity means speech and excludes silence.
+     */
+    TurnCoverage["TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO"] = "TURN_INCLUDES_AUDIO_ACTIVITY_AND_ALL_VIDEO";
 })(TurnCoverage || (TurnCoverage = {}));
 /** Scale of the generated music. */
 var Scale;
@@ -48011,7 +48270,6 @@ class ComputeTokensResponse {
 class GenerateVideosOperation {
     /**
      * Instantiates an Operation of the same type as the one being called with the fields set from the API response.
-     * @internal
      */
     _fromAPIResponse({ apiResponse, _isVertexAI, }) {
         const operation = new GenerateVideosOperation();
@@ -48051,7 +48309,6 @@ class UploadToFileSearchStoreResumableResponse {
 class ImportFileOperation {
     /**
      * Instantiates an Operation of the same type as the one being called with the fields set from the API response.
-     * @internal
      */
     _fromAPIResponse({ apiResponse, _isVertexAI, }) {
         const operation = new ImportFileOperation();
@@ -48161,7 +48418,6 @@ class LiveMusicServerMessage {
 class UploadToFileSearchStoreOperation {
     /**
      * Instantiates an Operation of the same type as the one being called with the fields set from the API response.
-     * @internal
      */
     _fromAPIResponse({ apiResponse, _isVertexAI, }) {
         const operation = new UploadToFileSearchStoreOperation();
@@ -49411,6 +49667,12 @@ function createBatchJobConfigToMldev(fromObject, parentObject) {
     if (getValueByPath(fromObject, ['dest']) !== undefined) {
         throw new Error('dest parameter is not supported in Gemini API.');
     }
+    const fromWebhookConfig = getValueByPath(fromObject, [
+        'webhookConfig',
+    ]);
+    if (parentObject !== undefined && fromWebhookConfig != null) {
+        setValueByPath(parentObject, ['batch', 'webhookConfig'], fromWebhookConfig);
+    }
     return toObject;
 }
 function createBatchJobConfigToVertex(fromObject, parentObject) {
@@ -49422,6 +49684,9 @@ function createBatchJobConfigToVertex(fromObject, parentObject) {
     const fromDest = getValueByPath(fromObject, ['dest']);
     if (parentObject !== undefined && fromDest != null) {
         setValueByPath(parentObject, ['outputConfig'], batchJobDestinationToVertex(tBatchJobDestination(fromDest)));
+    }
+    if (getValueByPath(fromObject, ['webhookConfig']) !== undefined) {
+        throw new Error('webhookConfig parameter is not supported in Vertex AI.');
     }
     return toObject;
 }
@@ -49581,6 +49846,12 @@ function embedContentConfigToMldev$1(fromObject, parentObject) {
     }
     if (getValueByPath(fromObject, ['autoTruncate']) !== undefined) {
         throw new Error('autoTruncate parameter is not supported in Gemini API.');
+    }
+    if (getValueByPath(fromObject, ['documentOcr']) !== undefined) {
+        throw new Error('documentOcr parameter is not supported in Gemini API.');
+    }
+    if (getValueByPath(fromObject, ['audioTrackExtraction']) !== undefined) {
+        throw new Error('audioTrackExtraction parameter is not supported in Gemini API.');
     }
     return toObject;
 }
@@ -49748,7 +50019,7 @@ function generateContentConfigToMldev$1(apiClient, fromObject, parentObject) {
         let transformedList = fromSafetySettings;
         if (Array.isArray(transformedList)) {
             transformedList = transformedList.map((item) => {
-                return safetySettingToMldev$1(item);
+                return safetySettingToMldev$3(item);
             });
         }
         setValueByPath(parentObject, ['safetySettings'], transformedList);
@@ -49814,6 +50085,10 @@ function generateContentConfigToMldev$1(apiClient, fromObject, parentObject) {
     if (getValueByPath(fromObject, ['modelArmorConfig']) !== undefined) {
         throw new Error('modelArmorConfig parameter is not supported in Gemini API.');
     }
+    const fromServiceTier = getValueByPath(fromObject, ['serviceTier']);
+    if (parentObject !== undefined && fromServiceTier != null) {
+        setValueByPath(parentObject, ['serviceTier'], fromServiceTier);
+    }
     return toObject;
 }
 function generateContentResponseFromMldev$1(fromObject) {
@@ -49853,6 +50128,10 @@ function generateContentResponseFromMldev$1(fromObject) {
     ]);
     if (fromUsageMetadata != null) {
         setValueByPath(toObject, ['usageMetadata'], fromUsageMetadata);
+    }
+    const fromModelStatus = getValueByPath(fromObject, ['modelStatus']);
+    if (fromModelStatus != null) {
+        setValueByPath(toObject, ['modelStatus'], fromModelStatus);
     }
     return toObject;
 }
@@ -50133,9 +50412,21 @@ function partToMldev$4(fromObject) {
     if (fromVideoMetadata != null) {
         setValueByPath(toObject, ['videoMetadata'], fromVideoMetadata);
     }
+    const fromToolCall = getValueByPath(fromObject, ['toolCall']);
+    if (fromToolCall != null) {
+        setValueByPath(toObject, ['toolCall'], fromToolCall);
+    }
+    const fromToolResponse = getValueByPath(fromObject, ['toolResponse']);
+    if (fromToolResponse != null) {
+        setValueByPath(toObject, ['toolResponse'], fromToolResponse);
+    }
+    const fromPartMetadata = getValueByPath(fromObject, ['partMetadata']);
+    if (fromPartMetadata != null) {
+        setValueByPath(toObject, ['partMetadata'], fromPartMetadata);
+    }
     return toObject;
 }
-function safetySettingToMldev$1(fromObject) {
+function safetySettingToMldev$3(fromObject) {
     const toObject = {};
     const fromCategory = getValueByPath(fromObject, ['category']);
     if (fromCategory != null) {
@@ -50163,6 +50454,10 @@ function toolConfigToMldev$2(fromObject) {
     ]);
     if (fromFunctionCallingConfig != null) {
         setValueByPath(toObject, ['functionCallingConfig'], functionCallingConfigToMldev$2(fromFunctionCallingConfig));
+    }
+    const fromIncludeServerSideToolInvocations = getValueByPath(fromObject, ['includeServerSideToolInvocations']);
+    if (fromIncludeServerSideToolInvocations != null) {
+        setValueByPath(toObject, ['includeServerSideToolInvocations'], fromIncludeServerSideToolInvocations);
     }
     return toObject;
 }
@@ -50986,6 +51281,24 @@ function contentToMldev$3(fromObject) {
     }
     return toObject;
 }
+function contentToVertex$2(fromObject) {
+    const toObject = {};
+    const fromParts = getValueByPath(fromObject, ['parts']);
+    if (fromParts != null) {
+        let transformedList = fromParts;
+        if (Array.isArray(transformedList)) {
+            transformedList = transformedList.map((item) => {
+                return partToVertex$2(item);
+            });
+        }
+        setValueByPath(toObject, ['parts'], transformedList);
+    }
+    const fromRole = getValueByPath(fromObject, ['role']);
+    if (fromRole != null) {
+        setValueByPath(toObject, ['role'], fromRole);
+    }
+    return toObject;
+}
 function createCachedContentConfigToMldev(fromObject, parentObject) {
     const toObject = {};
     const fromTtl = getValueByPath(fromObject, ['ttl']);
@@ -51054,7 +51367,7 @@ function createCachedContentConfigToVertex(fromObject, parentObject) {
         let transformedList = tContents(fromContents);
         if (Array.isArray(transformedList)) {
             transformedList = transformedList.map((item) => {
-                return item;
+                return contentToVertex$2(item);
             });
         }
         setValueByPath(parentObject, ['contents'], transformedList);
@@ -51063,7 +51376,7 @@ function createCachedContentConfigToVertex(fromObject, parentObject) {
         'systemInstruction',
     ]);
     if (parentObject !== undefined && fromSystemInstruction != null) {
-        setValueByPath(parentObject, ['systemInstruction'], tContent(fromSystemInstruction));
+        setValueByPath(parentObject, ['systemInstruction'], contentToVertex$2(tContent(fromSystemInstruction)));
     }
     const fromTools = getValueByPath(fromObject, ['tools']);
     if (parentObject !== undefined && fromTools != null) {
@@ -51077,7 +51390,7 @@ function createCachedContentConfigToVertex(fromObject, parentObject) {
     }
     const fromToolConfig = getValueByPath(fromObject, ['toolConfig']);
     if (parentObject !== undefined && fromToolConfig != null) {
-        setValueByPath(parentObject, ['toolConfig'], fromToolConfig);
+        setValueByPath(parentObject, ['toolConfig'], toolConfigToVertex$1(fromToolConfig));
     }
     const fromKmsKeyName = getValueByPath(fromObject, ['kmsKeyName']);
     if (parentObject !== undefined && fromKmsKeyName != null) {
@@ -51437,6 +51750,87 @@ function partToMldev$3(fromObject) {
     if (fromVideoMetadata != null) {
         setValueByPath(toObject, ['videoMetadata'], fromVideoMetadata);
     }
+    const fromToolCall = getValueByPath(fromObject, ['toolCall']);
+    if (fromToolCall != null) {
+        setValueByPath(toObject, ['toolCall'], fromToolCall);
+    }
+    const fromToolResponse = getValueByPath(fromObject, ['toolResponse']);
+    if (fromToolResponse != null) {
+        setValueByPath(toObject, ['toolResponse'], fromToolResponse);
+    }
+    const fromPartMetadata = getValueByPath(fromObject, ['partMetadata']);
+    if (fromPartMetadata != null) {
+        setValueByPath(toObject, ['partMetadata'], fromPartMetadata);
+    }
+    return toObject;
+}
+function partToVertex$2(fromObject) {
+    const toObject = {};
+    const fromMediaResolution = getValueByPath(fromObject, [
+        'mediaResolution',
+    ]);
+    if (fromMediaResolution != null) {
+        setValueByPath(toObject, ['mediaResolution'], fromMediaResolution);
+    }
+    const fromCodeExecutionResult = getValueByPath(fromObject, [
+        'codeExecutionResult',
+    ]);
+    if (fromCodeExecutionResult != null) {
+        setValueByPath(toObject, ['codeExecutionResult'], fromCodeExecutionResult);
+    }
+    const fromExecutableCode = getValueByPath(fromObject, [
+        'executableCode',
+    ]);
+    if (fromExecutableCode != null) {
+        setValueByPath(toObject, ['executableCode'], fromExecutableCode);
+    }
+    const fromFileData = getValueByPath(fromObject, ['fileData']);
+    if (fromFileData != null) {
+        setValueByPath(toObject, ['fileData'], fromFileData);
+    }
+    const fromFunctionCall = getValueByPath(fromObject, ['functionCall']);
+    if (fromFunctionCall != null) {
+        setValueByPath(toObject, ['functionCall'], fromFunctionCall);
+    }
+    const fromFunctionResponse = getValueByPath(fromObject, [
+        'functionResponse',
+    ]);
+    if (fromFunctionResponse != null) {
+        setValueByPath(toObject, ['functionResponse'], fromFunctionResponse);
+    }
+    const fromInlineData = getValueByPath(fromObject, ['inlineData']);
+    if (fromInlineData != null) {
+        setValueByPath(toObject, ['inlineData'], fromInlineData);
+    }
+    const fromText = getValueByPath(fromObject, ['text']);
+    if (fromText != null) {
+        setValueByPath(toObject, ['text'], fromText);
+    }
+    const fromThought = getValueByPath(fromObject, ['thought']);
+    if (fromThought != null) {
+        setValueByPath(toObject, ['thought'], fromThought);
+    }
+    const fromThoughtSignature = getValueByPath(fromObject, [
+        'thoughtSignature',
+    ]);
+    if (fromThoughtSignature != null) {
+        setValueByPath(toObject, ['thoughtSignature'], fromThoughtSignature);
+    }
+    const fromVideoMetadata = getValueByPath(fromObject, [
+        'videoMetadata',
+    ]);
+    if (fromVideoMetadata != null) {
+        setValueByPath(toObject, ['videoMetadata'], fromVideoMetadata);
+    }
+    if (getValueByPath(fromObject, ['toolCall']) !== undefined) {
+        throw new Error('toolCall parameter is not supported in Vertex AI.');
+    }
+    if (getValueByPath(fromObject, ['toolResponse']) !== undefined) {
+        throw new Error('toolResponse parameter is not supported in Vertex AI.');
+    }
+    if (getValueByPath(fromObject, ['partMetadata']) !== undefined) {
+        throw new Error('partMetadata parameter is not supported in Vertex AI.');
+    }
     return toObject;
 }
 function toolConfigToMldev$1(fromObject) {
@@ -51452,6 +51846,30 @@ function toolConfigToMldev$1(fromObject) {
     ]);
     if (fromFunctionCallingConfig != null) {
         setValueByPath(toObject, ['functionCallingConfig'], functionCallingConfigToMldev$1(fromFunctionCallingConfig));
+    }
+    const fromIncludeServerSideToolInvocations = getValueByPath(fromObject, ['includeServerSideToolInvocations']);
+    if (fromIncludeServerSideToolInvocations != null) {
+        setValueByPath(toObject, ['includeServerSideToolInvocations'], fromIncludeServerSideToolInvocations);
+    }
+    return toObject;
+}
+function toolConfigToVertex$1(fromObject) {
+    const toObject = {};
+    const fromRetrievalConfig = getValueByPath(fromObject, [
+        'retrievalConfig',
+    ]);
+    if (fromRetrievalConfig != null) {
+        setValueByPath(toObject, ['retrievalConfig'], fromRetrievalConfig);
+    }
+    const fromFunctionCallingConfig = getValueByPath(fromObject, [
+        'functionCallingConfig',
+    ]);
+    if (fromFunctionCallingConfig != null) {
+        setValueByPath(toObject, ['functionCallingConfig'], fromFunctionCallingConfig);
+    }
+    if (getValueByPath(fromObject, ['includeServerSideToolInvocations']) !==
+        undefined) {
+        throw new Error('includeServerSideToolInvocations parameter is not supported in Vertex AI.');
     }
     return toObject;
 }
@@ -52669,10 +53087,11 @@ const CONTENT_TYPE_HEADER = 'Content-Type';
 const SERVER_TIMEOUT_HEADER = 'X-Server-Timeout';
 const USER_AGENT_HEADER = 'User-Agent';
 const GOOGLE_API_CLIENT_HEADER = 'x-goog-api-client';
-const SDK_VERSION = '1.45.0'; // x-release-please-version
+const SDK_VERSION = '1.50.1'; // x-release-please-version
 const LIBRARY_LABEL = `google-genai-sdk/${SDK_VERSION}`;
 const VERTEX_AI_API_DEFAULT_VERSION = 'v1beta1';
 const GOOGLE_AI_API_DEFAULT_VERSION = 'v1beta';
+const MULTI_REGIONAL_LOCATIONS = new Set(['us', 'eu']);
 // Default retry options.
 // The config is based on https://cloud.google.com/storage/docs/retry-strategy.
 const DEFAULT_RETRY_ATTEMPTS = 5; // Including the initial call
@@ -52728,6 +53147,11 @@ class ApiClient {
                 this.clientOptions.location === 'global') {
                 // Vertex Express or global endpoint case.
                 initHttpOptions.baseUrl = 'https://aiplatform.googleapis.com/';
+            }
+            else if (this.clientOptions.project &&
+                this.clientOptions.location &&
+                MULTI_REGIONAL_LOCATIONS.has(this.clientOptions.location)) {
+                initHttpOptions.baseUrl = `https://aiplatform.${this.clientOptions.location}.rep.googleapis.com/`;
             }
             else if (this.clientOptions.project && this.clientOptions.location) {
                 initHttpOptions.baseUrl = `https://${this.clientOptions.location}-aiplatform.googleapis.com/`;
@@ -53367,20 +53791,20 @@ const INITIAL_RETRY_DELAY_MS = 1000;
 const DELAY_MULTIPLIER = 2;
 const X_GOOG_UPLOAD_STATUS_HEADER_FIELD = 'x-goog-upload-status';
 class CrossUploader {
-    async upload(file, uploadUrl, apiClient) {
+    async upload(file, uploadUrl, apiClient, httpOptions) {
         if (typeof file === 'string') {
             throw crossError();
         }
         else {
-            return uploadBlob(file, uploadUrl, apiClient);
+            return uploadBlob(file, uploadUrl, apiClient, httpOptions);
         }
     }
-    async uploadToFileSearchStore(file, uploadUrl, apiClient) {
+    async uploadToFileSearchStore(file, uploadUrl, apiClient, httpOptions) {
         if (typeof file === 'string') {
             throw crossError();
         }
         else {
-            return uploadBlobToFileSearchStore(file, uploadUrl, apiClient);
+            return uploadBlobToFileSearchStore(file, uploadUrl, apiClient, httpOptions);
         }
     }
     async stat(file) {
@@ -53392,18 +53816,18 @@ class CrossUploader {
         }
     }
 }
-async function uploadBlob(file, uploadUrl, apiClient) {
+async function uploadBlob(file, uploadUrl, apiClient, httpOptions) {
     var _a;
-    const response = await uploadBlobInternal(file, uploadUrl, apiClient);
+    const response = await uploadBlobInternal(file, uploadUrl, apiClient, httpOptions);
     const responseJson = (await (response === null || response === void 0 ? void 0 : response.json()));
     if (((_a = response === null || response === void 0 ? void 0 : response.headers) === null || _a === void 0 ? void 0 : _a[X_GOOG_UPLOAD_STATUS_HEADER_FIELD]) !== 'final') {
         throw new Error('Failed to upload file: Upload status is not finalized.');
     }
     return responseJson['file'];
 }
-async function uploadBlobToFileSearchStore(file, uploadUrl, apiClient) {
+async function uploadBlobToFileSearchStore(file, uploadUrl, apiClient, httpOptions) {
     var _a;
-    const response = await uploadBlobInternal(file, uploadUrl, apiClient);
+    const response = await uploadBlobInternal(file, uploadUrl, apiClient, httpOptions);
     const responseJson = (await (response === null || response === void 0 ? void 0 : response.json()));
     if (((_a = response === null || response === void 0 ? void 0 : response.headers) === null || _a === void 0 ? void 0 : _a[X_GOOG_UPLOAD_STATUS_HEADER_FIELD]) !== 'final') {
         throw new Error('Failed to upload file: Upload status is not finalized.');
@@ -53413,8 +53837,18 @@ async function uploadBlobToFileSearchStore(file, uploadUrl, apiClient) {
     Object.assign(typedResp, resp);
     return typedResp;
 }
-async function uploadBlobInternal(file, uploadUrl, apiClient) {
-    var _a, _b;
+async function uploadBlobInternal(file, uploadUrl, apiClient, httpOptions) {
+    var _a, _b, _c;
+    let finalUrl = uploadUrl;
+    const effectiveBaseUrl = (httpOptions === null || httpOptions === void 0 ? void 0 : httpOptions.baseUrl) || ((_a = apiClient.clientOptions.httpOptions) === null || _a === void 0 ? void 0 : _a.baseUrl);
+    if (effectiveBaseUrl) {
+        const baseUri = new URL(effectiveBaseUrl);
+        const uploadUri = new URL(uploadUrl);
+        uploadUri.protocol = baseUri.protocol;
+        uploadUri.host = baseUri.host;
+        uploadUri.port = baseUri.port;
+        finalUrl = uploadUri.toString();
+    }
     let fileSize = 0;
     let offset = 0;
     let response = new HttpResponse(new Response());
@@ -53429,21 +53863,14 @@ async function uploadBlobInternal(file, uploadUrl, apiClient) {
         let retryCount = 0;
         let currentDelayMs = INITIAL_RETRY_DELAY_MS;
         while (retryCount < MAX_RETRY_COUNT) {
+            const mergedHeaders = Object.assign(Object.assign({}, ((httpOptions === null || httpOptions === void 0 ? void 0 : httpOptions.headers) || {})), { 'X-Goog-Upload-Command': uploadCommand, 'X-Goog-Upload-Offset': String(offset), 'Content-Length': String(chunkSize) });
             response = await apiClient.request({
                 path: '',
                 body: chunk,
                 httpMethod: 'POST',
-                httpOptions: {
-                    apiVersion: '',
-                    baseUrl: uploadUrl,
-                    headers: {
-                        'X-Goog-Upload-Command': uploadCommand,
-                        'X-Goog-Upload-Offset': String(offset),
-                        'Content-Length': String(chunkSize),
-                    },
-                },
+                httpOptions: Object.assign(Object.assign({}, httpOptions), { apiVersion: '', baseUrl: finalUrl, headers: mergedHeaders }),
             });
-            if ((_a = response === null || response === void 0 ? void 0 : response.headers) === null || _a === void 0 ? void 0 : _a[X_GOOG_UPLOAD_STATUS_HEADER_FIELD]) {
+            if ((_b = response === null || response === void 0 ? void 0 : response.headers) === null || _b === void 0 ? void 0 : _b[X_GOOG_UPLOAD_STATUS_HEADER_FIELD]) {
                 break;
             }
             retryCount++;
@@ -53453,7 +53880,7 @@ async function uploadBlobInternal(file, uploadUrl, apiClient) {
         offset += chunkSize;
         // The `x-goog-upload-status` header field can be `active`, `final` and
         //`cancelled` in resposne.
-        if (((_b = response === null || response === void 0 ? void 0 : response.headers) === null || _b === void 0 ? void 0 : _b[X_GOOG_UPLOAD_STATUS_HEADER_FIELD]) !== 'active') {
+        if (((_c = response === null || response === void 0 ? void 0 : response.headers) === null || _c === void 0 ? void 0 : _c[X_GOOG_UPLOAD_STATUS_HEADER_FIELD]) !== 'active') {
             break;
         }
         // TODO(b/401391430) Investigate why the upload status is not finalized
@@ -55046,7 +55473,8 @@ class BaseInteractions extends APIResource {
         return this._client.delete(path `/${api_version}/interactions/${id}`, options);
     }
     /**
-     * Cancels an interaction by id. This only applies to background interactions that are still running.
+     * Cancels an interaction by id. This only applies to background interactions that
+     * are still running.
      *
      * @example
      * ```ts
@@ -55067,6 +55495,66 @@ class BaseInteractions extends APIResource {
 }
 BaseInteractions._key = Object.freeze(['interactions']);
 class Interactions extends BaseInteractions {
+}
+
+/**
+ * @license
+ * Copyright 2025 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+class BaseWebhooks extends APIResource {
+    /**
+     * Creates a new Webhook.
+     */
+    create(params, options) {
+        const { api_version = this._client.apiVersion, webhook_id } = params, body = __rest(params, ["api_version", "webhook_id"]);
+        return this._client.post(path `/${api_version}/webhooks`, Object.assign({ query: { webhook_id }, body }, options));
+    }
+    /**
+     * Updates an existing Webhook.
+     */
+    update(id, params, options) {
+        const { api_version = this._client.apiVersion, update_mask } = params, body = __rest(params, ["api_version", "update_mask"]);
+        return this._client.patch(path `/${api_version}/webhooks/${id}`, Object.assign({ query: { update_mask }, body }, options));
+    }
+    /**
+     * Lists all Webhooks.
+     */
+    list(params = {}, options) {
+        const _a = params !== null && params !== void 0 ? params : {}, { api_version = this._client.apiVersion } = _a, query = __rest(_a, ["api_version"]);
+        return this._client.get(path `/${api_version}/webhooks`, Object.assign({ query }, options));
+    }
+    /**
+     * Deletes a Webhook.
+     */
+    delete(id, params = {}, options) {
+        const { api_version = this._client.apiVersion } = params !== null && params !== void 0 ? params : {};
+        return this._client.delete(path `/${api_version}/webhooks/${id}`, options);
+    }
+    /**
+     * Gets a specific Webhook.
+     */
+    get(id, params = {}, options) {
+        const { api_version = this._client.apiVersion } = params !== null && params !== void 0 ? params : {};
+        return this._client.get(path `/${api_version}/webhooks/${id}`, options);
+    }
+    /**
+     * Sends a ping event to a Webhook.
+     */
+    ping(id, params = undefined, options) {
+        const { api_version = this._client.apiVersion, body } = params !== null && params !== void 0 ? params : {};
+        return this._client.post(path `/${api_version}/webhooks/${id}:ping`, Object.assign({ body: body }, options));
+    }
+    /**
+     * Generates a new signing secret for a Webhook.
+     */
+    rotateSigningSecret(id, params = {}, options) {
+        const _a = params !== null && params !== void 0 ? params : {}, { api_version = this._client.apiVersion } = _a, body = __rest(_a, ["api_version"]);
+        return this._client.post(path `/${api_version}/webhooks/${id}:rotateSigningSecret`, Object.assign({ body }, options));
+    }
+}
+BaseWebhooks._key = Object.freeze(['webhooks']);
+class Webhooks extends BaseWebhooks {
 }
 
 /**
@@ -55810,12 +56298,12 @@ const buildHeaders = (newHeaders) => {
  * Will return undefined if the environment variable doesn't exist or cannot be accessed.
  */
 const readEnv = (env) => {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e;
     if (typeof globalThis.process !== 'undefined') {
-        return (_c = (_b = (_a = globalThis.process.env) === null || _a === void 0 ? void 0 : _a[env]) === null || _b === void 0 ? void 0 : _b.trim()) !== null && _c !== void 0 ? _c : undefined;
+        return ((_b = (_a = globalThis.process.env) === null || _a === void 0 ? void 0 : _a[env]) === null || _b === void 0 ? void 0 : _b.trim()) || undefined;
     }
     if (typeof globalThis.Deno !== 'undefined') {
-        return (_f = (_e = (_d = globalThis.Deno.env) === null || _d === void 0 ? void 0 : _d.get) === null || _e === void 0 ? void 0 : _e.call(_d, env)) === null || _f === void 0 ? void 0 : _f.trim();
+        return ((_e = (_d = (_c = globalThis.Deno.env) === null || _c === void 0 ? void 0 : _c.get) === null || _d === void 0 ? void 0 : _d.call(_c, env)) === null || _e === void 0 ? void 0 : _e.trim()) || undefined;
     }
     return undefined;
 };
@@ -55902,7 +56390,7 @@ class BaseGeminiNextGenAPIClient {
         if (this.apiKey) {
             return buildHeaders([{ 'x-goog-api-key': this.apiKey }]);
         }
-        if (this.clientAdapter.isVertexAI()) {
+        if (this.clientAdapter && this.clientAdapter.isVertexAI()) {
             return buildHeaders([await this.clientAdapter.getAuthHeaders()]);
         }
         return undefined;
@@ -56256,6 +56744,7 @@ class GeminiNextGenAPIClient extends BaseGeminiNextGenAPIClient {
     constructor() {
         super(...arguments);
         this.interactions = new Interactions(this);
+        this.webhooks = new Webhooks(this);
     }
 }
 _a = GeminiNextGenAPIClient;
@@ -56275,6 +56764,7 @@ GeminiNextGenAPIClient.PermissionDeniedError = PermissionDeniedError;
 GeminiNextGenAPIClient.UnprocessableEntityError = UnprocessableEntityError;
 GeminiNextGenAPIClient.toFile = toFile;
 GeminiNextGenAPIClient.Interactions = Interactions;
+GeminiNextGenAPIClient.Webhooks = Webhooks;
 
 /**
  * @license
@@ -56338,6 +56828,24 @@ function contentToMldev$2(fromObject) {
         if (Array.isArray(transformedList)) {
             transformedList = transformedList.map((item) => {
                 return partToMldev$2(item);
+            });
+        }
+        setValueByPath(toObject, ['parts'], transformedList);
+    }
+    const fromRole = getValueByPath(fromObject, ['role']);
+    if (fromRole != null) {
+        setValueByPath(toObject, ['role'], fromRole);
+    }
+    return toObject;
+}
+function contentToVertex$1(fromObject) {
+    const toObject = {};
+    const fromParts = getValueByPath(fromObject, ['parts']);
+    if (fromParts != null) {
+        let transformedList = fromParts;
+        if (Array.isArray(transformedList)) {
+            transformedList = transformedList.map((item) => {
+                return partToVertex$1(item);
             });
         }
         setValueByPath(toObject, ['parts'], transformedList);
@@ -56691,6 +57199,22 @@ function liveConnectConfigToMldev$1(fromObject, parentObject) {
     if (getValueByPath(fromObject, ['explicitVadSignal']) !== undefined) {
         throw new Error('explicitVadSignal parameter is not supported in Gemini API.');
     }
+    const fromAvatarConfig = getValueByPath(fromObject, ['avatarConfig']);
+    if (parentObject !== undefined && fromAvatarConfig != null) {
+        setValueByPath(parentObject, ['setup', 'avatarConfig'], fromAvatarConfig);
+    }
+    const fromSafetySettings = getValueByPath(fromObject, [
+        'safetySettings',
+    ]);
+    if (parentObject !== undefined && fromSafetySettings != null) {
+        let transformedList = fromSafetySettings;
+        if (Array.isArray(transformedList)) {
+            transformedList = transformedList.map((item) => {
+                return safetySettingToMldev$2(item);
+            });
+        }
+        setValueByPath(parentObject, ['setup', 'safetySettings'], transformedList);
+    }
     return toObject;
 }
 function liveConnectConfigToVertex(fromObject, parentObject) {
@@ -56755,7 +57279,7 @@ function liveConnectConfigToVertex(fromObject, parentObject) {
         'systemInstruction',
     ]);
     if (parentObject !== undefined && fromSystemInstruction != null) {
-        setValueByPath(parentObject, ['setup', 'systemInstruction'], tContent(fromSystemInstruction));
+        setValueByPath(parentObject, ['setup', 'systemInstruction'], contentToVertex$1(tContent(fromSystemInstruction)));
     }
     const fromTools = getValueByPath(fromObject, ['tools']);
     if (parentObject !== undefined && fromTools != null) {
@@ -56806,6 +57330,22 @@ function liveConnectConfigToVertex(fromObject, parentObject) {
     ]);
     if (parentObject !== undefined && fromExplicitVadSignal != null) {
         setValueByPath(parentObject, ['setup', 'explicitVadSignal'], fromExplicitVadSignal);
+    }
+    const fromAvatarConfig = getValueByPath(fromObject, ['avatarConfig']);
+    if (parentObject !== undefined && fromAvatarConfig != null) {
+        setValueByPath(parentObject, ['setup', 'avatarConfig'], fromAvatarConfig);
+    }
+    const fromSafetySettings = getValueByPath(fromObject, [
+        'safetySettings',
+    ]);
+    if (parentObject !== undefined && fromSafetySettings != null) {
+        let transformedList = fromSafetySettings;
+        if (Array.isArray(transformedList)) {
+            transformedList = transformedList.map((item) => {
+                return item;
+            });
+        }
+        setValueByPath(parentObject, ['setup', 'safetySettings'], transformedList);
     }
     return toObject;
 }
@@ -57054,6 +57594,102 @@ function partToMldev$2(fromObject) {
     ]);
     if (fromVideoMetadata != null) {
         setValueByPath(toObject, ['videoMetadata'], fromVideoMetadata);
+    }
+    const fromToolCall = getValueByPath(fromObject, ['toolCall']);
+    if (fromToolCall != null) {
+        setValueByPath(toObject, ['toolCall'], fromToolCall);
+    }
+    const fromToolResponse = getValueByPath(fromObject, ['toolResponse']);
+    if (fromToolResponse != null) {
+        setValueByPath(toObject, ['toolResponse'], fromToolResponse);
+    }
+    const fromPartMetadata = getValueByPath(fromObject, ['partMetadata']);
+    if (fromPartMetadata != null) {
+        setValueByPath(toObject, ['partMetadata'], fromPartMetadata);
+    }
+    return toObject;
+}
+function partToVertex$1(fromObject) {
+    const toObject = {};
+    const fromMediaResolution = getValueByPath(fromObject, [
+        'mediaResolution',
+    ]);
+    if (fromMediaResolution != null) {
+        setValueByPath(toObject, ['mediaResolution'], fromMediaResolution);
+    }
+    const fromCodeExecutionResult = getValueByPath(fromObject, [
+        'codeExecutionResult',
+    ]);
+    if (fromCodeExecutionResult != null) {
+        setValueByPath(toObject, ['codeExecutionResult'], fromCodeExecutionResult);
+    }
+    const fromExecutableCode = getValueByPath(fromObject, [
+        'executableCode',
+    ]);
+    if (fromExecutableCode != null) {
+        setValueByPath(toObject, ['executableCode'], fromExecutableCode);
+    }
+    const fromFileData = getValueByPath(fromObject, ['fileData']);
+    if (fromFileData != null) {
+        setValueByPath(toObject, ['fileData'], fromFileData);
+    }
+    const fromFunctionCall = getValueByPath(fromObject, ['functionCall']);
+    if (fromFunctionCall != null) {
+        setValueByPath(toObject, ['functionCall'], fromFunctionCall);
+    }
+    const fromFunctionResponse = getValueByPath(fromObject, [
+        'functionResponse',
+    ]);
+    if (fromFunctionResponse != null) {
+        setValueByPath(toObject, ['functionResponse'], fromFunctionResponse);
+    }
+    const fromInlineData = getValueByPath(fromObject, ['inlineData']);
+    if (fromInlineData != null) {
+        setValueByPath(toObject, ['inlineData'], fromInlineData);
+    }
+    const fromText = getValueByPath(fromObject, ['text']);
+    if (fromText != null) {
+        setValueByPath(toObject, ['text'], fromText);
+    }
+    const fromThought = getValueByPath(fromObject, ['thought']);
+    if (fromThought != null) {
+        setValueByPath(toObject, ['thought'], fromThought);
+    }
+    const fromThoughtSignature = getValueByPath(fromObject, [
+        'thoughtSignature',
+    ]);
+    if (fromThoughtSignature != null) {
+        setValueByPath(toObject, ['thoughtSignature'], fromThoughtSignature);
+    }
+    const fromVideoMetadata = getValueByPath(fromObject, [
+        'videoMetadata',
+    ]);
+    if (fromVideoMetadata != null) {
+        setValueByPath(toObject, ['videoMetadata'], fromVideoMetadata);
+    }
+    if (getValueByPath(fromObject, ['toolCall']) !== undefined) {
+        throw new Error('toolCall parameter is not supported in Vertex AI.');
+    }
+    if (getValueByPath(fromObject, ['toolResponse']) !== undefined) {
+        throw new Error('toolResponse parameter is not supported in Vertex AI.');
+    }
+    if (getValueByPath(fromObject, ['partMetadata']) !== undefined) {
+        throw new Error('partMetadata parameter is not supported in Vertex AI.');
+    }
+    return toObject;
+}
+function safetySettingToMldev$2(fromObject) {
+    const toObject = {};
+    const fromCategory = getValueByPath(fromObject, ['category']);
+    if (fromCategory != null) {
+        setValueByPath(toObject, ['category'], fromCategory);
+    }
+    if (getValueByPath(fromObject, ['method']) !== undefined) {
+        throw new Error('method parameter is not supported in Gemini API.');
+    }
+    const fromThreshold = getValueByPath(fromObject, ['threshold']);
+    if (fromThreshold != null) {
+        setValueByPath(toObject, ['threshold'], fromThreshold);
     }
     return toObject;
 }
@@ -57423,7 +58059,7 @@ function citationMetadataFromMldev(fromObject, _rootObject) {
     }
     return toObject;
 }
-function computeTokensParametersToVertex(apiClient, fromObject, _rootObject) {
+function computeTokensParametersToVertex(apiClient, fromObject, rootObject) {
     const toObject = {};
     const fromModel = getValueByPath(fromObject, ['model']);
     if (fromModel != null) {
@@ -57434,7 +58070,7 @@ function computeTokensParametersToVertex(apiClient, fromObject, _rootObject) {
         let transformedList = tContents(fromContents);
         if (Array.isArray(transformedList)) {
             transformedList = transformedList.map((item) => {
-                return item;
+                return contentToVertex(item);
             });
         }
         setValueByPath(toObject, ['contents'], transformedList);
@@ -57503,6 +58139,24 @@ function contentToMldev$1(fromObject, rootObject) {
     }
     return toObject;
 }
+function contentToVertex(fromObject, rootObject) {
+    const toObject = {};
+    const fromParts = getValueByPath(fromObject, ['parts']);
+    if (fromParts != null) {
+        let transformedList = fromParts;
+        if (Array.isArray(transformedList)) {
+            transformedList = transformedList.map((item) => {
+                return partToVertex(item);
+            });
+        }
+        setValueByPath(toObject, ['parts'], transformedList);
+    }
+    const fromRole = getValueByPath(fromObject, ['role']);
+    if (fromRole != null) {
+        setValueByPath(toObject, ['role'], fromRole);
+    }
+    return toObject;
+}
 function controlReferenceConfigToVertex(fromObject, _rootObject) {
     const toObject = {};
     const fromControlType = getValueByPath(fromObject, ['controlType']);
@@ -57536,7 +58190,7 @@ function countTokensConfigToVertex(fromObject, parentObject, rootObject) {
         'systemInstruction',
     ]);
     if (parentObject !== undefined && fromSystemInstruction != null) {
-        setValueByPath(parentObject, ['systemInstruction'], tContent(fromSystemInstruction));
+        setValueByPath(parentObject, ['systemInstruction'], contentToVertex(tContent(fromSystemInstruction)));
     }
     const fromTools = getValueByPath(fromObject, ['tools']);
     if (parentObject !== undefined && fromTools != null) {
@@ -57589,7 +58243,7 @@ function countTokensParametersToVertex(apiClient, fromObject, rootObject) {
         let transformedList = tContents(fromContents);
         if (Array.isArray(transformedList)) {
             transformedList = transformedList.map((item) => {
-                return item;
+                return contentToVertex(item);
             });
         }
         setValueByPath(toObject, ['contents'], transformedList);
@@ -57832,6 +58486,12 @@ function embedContentConfigToMldev(fromObject, parentObject, _rootObject) {
     if (getValueByPath(fromObject, ['autoTruncate']) !== undefined) {
         throw new Error('autoTruncate parameter is not supported in Gemini API.');
     }
+    if (getValueByPath(fromObject, ['documentOcr']) !== undefined) {
+        throw new Error('documentOcr parameter is not supported in Gemini API.');
+    }
+    if (getValueByPath(fromObject, ['audioTrackExtraction']) !== undefined) {
+        throw new Error('audioTrackExtraction parameter is not supported in Gemini API.');
+    }
     return toObject;
 }
 function embedContentConfigToVertex(fromObject, parentObject, rootObject) {
@@ -57851,7 +58511,7 @@ function embedContentConfigToVertex(fromObject, parentObject, rootObject) {
     else if (discriminatorTaskType === 'EMBED_CONTENT') {
         const fromTaskType = getValueByPath(fromObject, ['taskType']);
         if (parentObject !== undefined && fromTaskType != null) {
-            setValueByPath(parentObject, ['taskType'], fromTaskType);
+            setValueByPath(parentObject, ['embedContentConfig', 'taskType'], fromTaskType);
         }
     }
     let discriminatorTitle = getValueByPath(rootObject, [
@@ -57869,7 +58529,7 @@ function embedContentConfigToVertex(fromObject, parentObject, rootObject) {
     else if (discriminatorTitle === 'EMBED_CONTENT') {
         const fromTitle = getValueByPath(fromObject, ['title']);
         if (parentObject !== undefined && fromTitle != null) {
-            setValueByPath(parentObject, ['title'], fromTitle);
+            setValueByPath(parentObject, ['embedContentConfig', 'title'], fromTitle);
         }
     }
     let discriminatorOutputDimensionality = getValueByPath(rootObject, [
@@ -57891,7 +58551,7 @@ function embedContentConfigToVertex(fromObject, parentObject, rootObject) {
             'outputDimensionality',
         ]);
         if (parentObject !== undefined && fromOutputDimensionality != null) {
-            setValueByPath(parentObject, ['outputDimensionality'], fromOutputDimensionality);
+            setValueByPath(parentObject, ['embedContentConfig', 'outputDimensionality'], fromOutputDimensionality);
         }
     }
     let discriminatorMimeType = getValueByPath(rootObject, [
@@ -57925,7 +58585,33 @@ function embedContentConfigToVertex(fromObject, parentObject, rootObject) {
             'autoTruncate',
         ]);
         if (parentObject !== undefined && fromAutoTruncate != null) {
-            setValueByPath(parentObject, ['autoTruncate'], fromAutoTruncate);
+            setValueByPath(parentObject, ['embedContentConfig', 'autoTruncate'], fromAutoTruncate);
+        }
+    }
+    let discriminatorDocumentOcr = getValueByPath(rootObject, [
+        'embeddingApiType',
+    ]);
+    if (discriminatorDocumentOcr === undefined) {
+        discriminatorDocumentOcr = 'PREDICT';
+    }
+    if (discriminatorDocumentOcr === 'EMBED_CONTENT') {
+        const fromDocumentOcr = getValueByPath(fromObject, ['documentOcr']);
+        if (parentObject !== undefined && fromDocumentOcr != null) {
+            setValueByPath(parentObject, ['embedContentConfig', 'documentOcr'], fromDocumentOcr);
+        }
+    }
+    let discriminatorAudioTrackExtraction = getValueByPath(rootObject, [
+        'embeddingApiType',
+    ]);
+    if (discriminatorAudioTrackExtraction === undefined) {
+        discriminatorAudioTrackExtraction = 'PREDICT';
+    }
+    if (discriminatorAudioTrackExtraction === 'EMBED_CONTENT') {
+        const fromAudioTrackExtraction = getValueByPath(fromObject, [
+            'audioTrackExtraction',
+        ]);
+        if (parentObject !== undefined && fromAudioTrackExtraction != null) {
+            setValueByPath(parentObject, ['embedContentConfig', 'audioTrackExtraction'], fromAudioTrackExtraction);
         }
     }
     return toObject;
@@ -57993,7 +58679,7 @@ function embedContentParametersPrivateToVertex(apiClient, fromObject, rootObject
     if (discriminatorContent === 'EMBED_CONTENT') {
         const fromContent = getValueByPath(fromObject, ['content']);
         if (fromContent != null) {
-            setValueByPath(toObject, ['content'], tContent(fromContent));
+            setValueByPath(toObject, ['content'], contentToVertex(tContent(fromContent)));
         }
     }
     const fromConfig = getValueByPath(fromObject, ['config']);
@@ -58270,7 +58956,7 @@ function generateContentConfigToMldev(apiClient, fromObject, parentObject, rootO
         let transformedList = fromSafetySettings;
         if (Array.isArray(transformedList)) {
             transformedList = transformedList.map((item) => {
-                return safetySettingToMldev(item);
+                return safetySettingToMldev$1(item);
             });
         }
         setValueByPath(parentObject, ['safetySettings'], transformedList);
@@ -58336,6 +59022,10 @@ function generateContentConfigToMldev(apiClient, fromObject, parentObject, rootO
     if (getValueByPath(fromObject, ['modelArmorConfig']) !== undefined) {
         throw new Error('modelArmorConfig parameter is not supported in Gemini API.');
     }
+    const fromServiceTier = getValueByPath(fromObject, ['serviceTier']);
+    if (parentObject !== undefined && fromServiceTier != null) {
+        setValueByPath(parentObject, ['serviceTier'], fromServiceTier);
+    }
     return toObject;
 }
 function generateContentConfigToVertex(apiClient, fromObject, parentObject, rootObject) {
@@ -58344,7 +59034,7 @@ function generateContentConfigToVertex(apiClient, fromObject, parentObject, root
         'systemInstruction',
     ]);
     if (parentObject !== undefined && fromSystemInstruction != null) {
-        setValueByPath(parentObject, ['systemInstruction'], tContent(fromSystemInstruction));
+        setValueByPath(parentObject, ['systemInstruction'], contentToVertex(tContent(fromSystemInstruction)));
     }
     const fromTemperature = getValueByPath(fromObject, ['temperature']);
     if (fromTemperature != null) {
@@ -58456,7 +59146,7 @@ function generateContentConfigToVertex(apiClient, fromObject, parentObject, root
     }
     const fromToolConfig = getValueByPath(fromObject, ['toolConfig']);
     if (parentObject !== undefined && fromToolConfig != null) {
-        setValueByPath(parentObject, ['toolConfig'], fromToolConfig);
+        setValueByPath(parentObject, ['toolConfig'], toolConfigToVertex(fromToolConfig));
     }
     const fromLabels = getValueByPath(fromObject, ['labels']);
     if (parentObject !== undefined && fromLabels != null) {
@@ -58510,6 +59200,10 @@ function generateContentConfigToVertex(apiClient, fromObject, parentObject, root
     if (parentObject !== undefined && fromModelArmorConfig != null) {
         setValueByPath(parentObject, ['modelArmorConfig'], fromModelArmorConfig);
     }
+    const fromServiceTier = getValueByPath(fromObject, ['serviceTier']);
+    if (parentObject !== undefined && fromServiceTier != null) {
+        setValueByPath(parentObject, ['serviceTier'], fromServiceTier);
+    }
     return toObject;
 }
 function generateContentParametersToMldev(apiClient, fromObject, rootObject) {
@@ -58545,7 +59239,7 @@ function generateContentParametersToVertex(apiClient, fromObject, rootObject) {
         let transformedList = tContents(fromContents);
         if (Array.isArray(transformedList)) {
             transformedList = transformedList.map((item) => {
-                return item;
+                return contentToVertex(item);
             });
         }
         setValueByPath(toObject, ['contents'], transformedList);
@@ -58593,6 +59287,10 @@ function generateContentResponseFromMldev(fromObject, rootObject) {
     ]);
     if (fromUsageMetadata != null) {
         setValueByPath(toObject, ['usageMetadata'], fromUsageMetadata);
+    }
+    const fromModelStatus = getValueByPath(fromObject, ['modelStatus']);
+    if (fromModelStatus != null) {
+        setValueByPath(toObject, ['modelStatus'], fromModelStatus);
     }
     return toObject;
 }
@@ -58979,6 +59677,15 @@ function generateVideosConfigToMldev(fromObject, parentObject, rootObject) {
     if (getValueByPath(fromObject, ['compressionQuality']) !== undefined) {
         throw new Error('compressionQuality parameter is not supported in Gemini API.');
     }
+    if (getValueByPath(fromObject, ['labels']) !== undefined) {
+        throw new Error('labels parameter is not supported in Gemini API.');
+    }
+    const fromWebhookConfig = getValueByPath(fromObject, [
+        'webhookConfig',
+    ]);
+    if (parentObject !== undefined && fromWebhookConfig != null) {
+        setValueByPath(parentObject, ['webhookConfig'], fromWebhookConfig);
+    }
     return toObject;
 }
 function generateVideosConfigToVertex(fromObject, parentObject, rootObject) {
@@ -59068,6 +59775,13 @@ function generateVideosConfigToVertex(fromObject, parentObject, rootObject) {
     ]);
     if (parentObject !== undefined && fromCompressionQuality != null) {
         setValueByPath(parentObject, ['parameters', 'compressionQuality'], fromCompressionQuality);
+    }
+    const fromLabels = getValueByPath(fromObject, ['labels']);
+    if (parentObject !== undefined && fromLabels != null) {
+        setValueByPath(parentObject, ['labels'], fromLabels);
+    }
+    if (getValueByPath(fromObject, ['webhookConfig']) !== undefined) {
+        throw new Error('webhookConfig parameter is not supported in Vertex AI.');
     }
     return toObject;
 }
@@ -59949,6 +60663,87 @@ function partToMldev$1(fromObject, rootObject) {
     if (fromVideoMetadata != null) {
         setValueByPath(toObject, ['videoMetadata'], fromVideoMetadata);
     }
+    const fromToolCall = getValueByPath(fromObject, ['toolCall']);
+    if (fromToolCall != null) {
+        setValueByPath(toObject, ['toolCall'], fromToolCall);
+    }
+    const fromToolResponse = getValueByPath(fromObject, ['toolResponse']);
+    if (fromToolResponse != null) {
+        setValueByPath(toObject, ['toolResponse'], fromToolResponse);
+    }
+    const fromPartMetadata = getValueByPath(fromObject, ['partMetadata']);
+    if (fromPartMetadata != null) {
+        setValueByPath(toObject, ['partMetadata'], fromPartMetadata);
+    }
+    return toObject;
+}
+function partToVertex(fromObject, _rootObject) {
+    const toObject = {};
+    const fromMediaResolution = getValueByPath(fromObject, [
+        'mediaResolution',
+    ]);
+    if (fromMediaResolution != null) {
+        setValueByPath(toObject, ['mediaResolution'], fromMediaResolution);
+    }
+    const fromCodeExecutionResult = getValueByPath(fromObject, [
+        'codeExecutionResult',
+    ]);
+    if (fromCodeExecutionResult != null) {
+        setValueByPath(toObject, ['codeExecutionResult'], fromCodeExecutionResult);
+    }
+    const fromExecutableCode = getValueByPath(fromObject, [
+        'executableCode',
+    ]);
+    if (fromExecutableCode != null) {
+        setValueByPath(toObject, ['executableCode'], fromExecutableCode);
+    }
+    const fromFileData = getValueByPath(fromObject, ['fileData']);
+    if (fromFileData != null) {
+        setValueByPath(toObject, ['fileData'], fromFileData);
+    }
+    const fromFunctionCall = getValueByPath(fromObject, ['functionCall']);
+    if (fromFunctionCall != null) {
+        setValueByPath(toObject, ['functionCall'], fromFunctionCall);
+    }
+    const fromFunctionResponse = getValueByPath(fromObject, [
+        'functionResponse',
+    ]);
+    if (fromFunctionResponse != null) {
+        setValueByPath(toObject, ['functionResponse'], fromFunctionResponse);
+    }
+    const fromInlineData = getValueByPath(fromObject, ['inlineData']);
+    if (fromInlineData != null) {
+        setValueByPath(toObject, ['inlineData'], fromInlineData);
+    }
+    const fromText = getValueByPath(fromObject, ['text']);
+    if (fromText != null) {
+        setValueByPath(toObject, ['text'], fromText);
+    }
+    const fromThought = getValueByPath(fromObject, ['thought']);
+    if (fromThought != null) {
+        setValueByPath(toObject, ['thought'], fromThought);
+    }
+    const fromThoughtSignature = getValueByPath(fromObject, [
+        'thoughtSignature',
+    ]);
+    if (fromThoughtSignature != null) {
+        setValueByPath(toObject, ['thoughtSignature'], fromThoughtSignature);
+    }
+    const fromVideoMetadata = getValueByPath(fromObject, [
+        'videoMetadata',
+    ]);
+    if (fromVideoMetadata != null) {
+        setValueByPath(toObject, ['videoMetadata'], fromVideoMetadata);
+    }
+    if (getValueByPath(fromObject, ['toolCall']) !== undefined) {
+        throw new Error('toolCall parameter is not supported in Vertex AI.');
+    }
+    if (getValueByPath(fromObject, ['toolResponse']) !== undefined) {
+        throw new Error('toolResponse parameter is not supported in Vertex AI.');
+    }
+    if (getValueByPath(fromObject, ['partMetadata']) !== undefined) {
+        throw new Error('partMetadata parameter is not supported in Vertex AI.');
+    }
     return toObject;
 }
 function productImageToVertex(fromObject, rootObject) {
@@ -60163,7 +60958,7 @@ function safetyAttributesFromVertex(fromObject, _rootObject) {
     }
     return toObject;
 }
-function safetySettingToMldev(fromObject, _rootObject) {
+function safetySettingToMldev$1(fromObject, _rootObject) {
     const toObject = {};
     const fromCategory = getValueByPath(fromObject, ['category']);
     if (fromCategory != null) {
@@ -60281,6 +61076,30 @@ function toolConfigToMldev(fromObject, rootObject) {
     ]);
     if (fromFunctionCallingConfig != null) {
         setValueByPath(toObject, ['functionCallingConfig'], functionCallingConfigToMldev(fromFunctionCallingConfig));
+    }
+    const fromIncludeServerSideToolInvocations = getValueByPath(fromObject, ['includeServerSideToolInvocations']);
+    if (fromIncludeServerSideToolInvocations != null) {
+        setValueByPath(toObject, ['includeServerSideToolInvocations'], fromIncludeServerSideToolInvocations);
+    }
+    return toObject;
+}
+function toolConfigToVertex(fromObject, _rootObject) {
+    const toObject = {};
+    const fromRetrievalConfig = getValueByPath(fromObject, [
+        'retrievalConfig',
+    ]);
+    if (fromRetrievalConfig != null) {
+        setValueByPath(toObject, ['retrievalConfig'], fromRetrievalConfig);
+    }
+    const fromFunctionCallingConfig = getValueByPath(fromObject, [
+        'functionCallingConfig',
+    ]);
+    if (fromFunctionCallingConfig != null) {
+        setValueByPath(toObject, ['functionCallingConfig'], fromFunctionCallingConfig);
+    }
+    if (getValueByPath(fromObject, ['includeServerSideToolInvocations']) !==
+        undefined) {
+        throw new Error('includeServerSideToolInvocations parameter is not supported in Vertex AI.');
     }
     return toObject;
 }
@@ -61392,7 +62211,7 @@ class Session {
             }
         }
         const clientMessage = {
-            toolResponse: { functionResponses: functionResponses },
+            toolResponse: { 'functionResponses': functionResponses },
         };
         return clientMessage;
     }
@@ -61657,6 +62476,10 @@ class Models extends BaseModule {
          */
         this.embedContent = async (params) => {
             if (!this.apiClient.isVertexAI()) {
+                const isGeminiEmbedding2Model = params.model.includes('gemini-embedding-2');
+                if (isGeminiEmbedding2Model) {
+                    params.contents = tContents(params.contents);
+                }
                 return await this.embedContentInternal(params);
             }
             const isVertexEmbedContentModel = (params.model.includes('gemini') &&
@@ -62593,29 +63416,15 @@ class Models extends BaseModule {
     /**
      * Recontextualizes an image.
      *
-     * There are two types of recontextualization currently supported:
-     * 1) Imagen Product Recontext - Generate images of products in new scenes
-     *    and contexts.
-     * 2) Virtual Try-On: Generate images of persons modeling fashion products.
+     * There is one type of recontextualization currently supported:
+     * 1) Virtual Try-On: Generate images of persons modeling fashion products.
      *
      * @param params - The parameters for recontextualizing an image.
      * @return The response from the API.
      *
      * @example
      * ```ts
-     * const response1 = await ai.models.recontextImage({
-     *  model: 'imagen-product-recontext-preview-06-30',
-     *  source: {
-     *    prompt: 'In a modern kitchen setting.',
-     *    productImages: [productImage],
-     *  },
-     *  config: {
-     *    numberOfImages: 1,
-     *  },
-     * });
-     * console.log(response1?.generatedImages?.[0]?.image?.imageBytes);
-     *
-     * const response2 = await ai.models.recontextImage({
+     * const response = await ai.models.recontextImage({
      *  model: 'virtual-try-on-001',
      *  source: {
      *    personImage: personImage,
@@ -62625,7 +63434,7 @@ class Models extends BaseModule {
      *    numberOfImages: 1,
      *  },
      * });
-     * console.log(response2?.generatedImages?.[0]?.image?.imageBytes);
+     * console.log(response?.generatedImages?.[0]?.image?.imageBytes);
      * ```
      */
     async recontextImage(params) {
@@ -63650,6 +64459,22 @@ function liveConnectConfigToMldev(fromObject, parentObject) {
     if (getValueByPath(fromObject, ['explicitVadSignal']) !== undefined) {
         throw new Error('explicitVadSignal parameter is not supported in Gemini API.');
     }
+    const fromAvatarConfig = getValueByPath(fromObject, ['avatarConfig']);
+    if (parentObject !== undefined && fromAvatarConfig != null) {
+        setValueByPath(parentObject, ['setup', 'avatarConfig'], fromAvatarConfig);
+    }
+    const fromSafetySettings = getValueByPath(fromObject, [
+        'safetySettings',
+    ]);
+    if (parentObject !== undefined && fromSafetySettings != null) {
+        let transformedList = fromSafetySettings;
+        if (Array.isArray(transformedList)) {
+            transformedList = transformedList.map((item) => {
+                return safetySettingToMldev(item);
+            });
+        }
+        setValueByPath(parentObject, ['setup', 'safetySettings'], transformedList);
+    }
     return toObject;
 }
 function liveConnectConstraintsToMldev(apiClient, fromObject) {
@@ -63721,6 +64546,33 @@ function partToMldev(fromObject) {
     ]);
     if (fromVideoMetadata != null) {
         setValueByPath(toObject, ['videoMetadata'], fromVideoMetadata);
+    }
+    const fromToolCall = getValueByPath(fromObject, ['toolCall']);
+    if (fromToolCall != null) {
+        setValueByPath(toObject, ['toolCall'], fromToolCall);
+    }
+    const fromToolResponse = getValueByPath(fromObject, ['toolResponse']);
+    if (fromToolResponse != null) {
+        setValueByPath(toObject, ['toolResponse'], fromToolResponse);
+    }
+    const fromPartMetadata = getValueByPath(fromObject, ['partMetadata']);
+    if (fromPartMetadata != null) {
+        setValueByPath(toObject, ['partMetadata'], fromPartMetadata);
+    }
+    return toObject;
+}
+function safetySettingToMldev(fromObject) {
+    const toObject = {};
+    const fromCategory = getValueByPath(fromObject, ['category']);
+    if (fromCategory != null) {
+        setValueByPath(toObject, ['category'], fromCategory);
+    }
+    if (getValueByPath(fromObject, ['method']) !== undefined) {
+        throw new Error('method parameter is not supported in Gemini API.');
+    }
+    const fromThreshold = getValueByPath(fromObject, ['threshold']);
+    if (fromThreshold != null) {
+        setValueByPath(toObject, ['threshold'], fromThreshold);
     }
     return toObject;
 }
@@ -64356,6 +65208,12 @@ function createTuningJobConfigToVertex(fromObject, parentObject, rootObject) {
             setValueByPath(parentObject, ['supervisedTuningSpec', 'tuningMode'], fromTuningMode);
         }
     }
+    else if (discriminatorTuningMode === 'DISTILLATION') {
+        const fromTuningMode = getValueByPath(fromObject, ['tuningMode']);
+        if (parentObject !== undefined && fromTuningMode != null) {
+            setValueByPath(parentObject, ['distillationSpec', 'tuningMode'], fromTuningMode);
+        }
+    }
     const fromCustomBaseModel = getValueByPath(fromObject, [
         'customBaseModel',
     ]);
@@ -64375,6 +65233,12 @@ function createTuningJobConfigToVertex(fromObject, parentObject, rootObject) {
             setValueByPath(parentObject, ['supervisedTuningSpec', 'hyperParameters', 'batchSize'], fromBatchSize);
         }
     }
+    else if (discriminatorBatchSize === 'DISTILLATION') {
+        const fromBatchSize = getValueByPath(fromObject, ['batchSize']);
+        if (parentObject !== undefined && fromBatchSize != null) {
+            setValueByPath(parentObject, ['distillationSpec', 'hyperParameters', 'batchSize'], fromBatchSize);
+        }
+    }
     let discriminatorLearningRate = getValueByPath(rootObject, [
         'config',
         'method',
@@ -64388,6 +65252,14 @@ function createTuningJobConfigToVertex(fromObject, parentObject, rootObject) {
         ]);
         if (parentObject !== undefined && fromLearningRate != null) {
             setValueByPath(parentObject, ['supervisedTuningSpec', 'hyperParameters', 'learningRate'], fromLearningRate);
+        }
+    }
+    else if (discriminatorLearningRate === 'DISTILLATION') {
+        const fromLearningRate = getValueByPath(fromObject, [
+            'learningRate',
+        ]);
+        if (parentObject !== undefined && fromLearningRate != null) {
+            setValueByPath(parentObject, ['distillationSpec', 'hyperParameters', 'learningRate'], fromLearningRate);
         }
     }
     const fromLabels = getValueByPath(fromObject, ['labels']);
@@ -64893,6 +65765,18 @@ function tuningJobFromVertex(fromObject, _rootObject) {
     if (fromVeoTuningSpec != null) {
         setValueByPath(toObject, ['veoTuningSpec'], fromVeoTuningSpec);
     }
+    const fromDistillationSamplingSpec = getValueByPath(fromObject, [
+        'distillationSamplingSpec',
+    ]);
+    if (fromDistillationSamplingSpec != null) {
+        setValueByPath(toObject, ['distillationSamplingSpec'], fromDistillationSamplingSpec);
+    }
+    const fromTuningJobMetadata = getValueByPath(fromObject, [
+        'tuningJobMetadata',
+    ]);
+    if (fromTuningJobMetadata != null) {
+        setValueByPath(toObject, ['tuningJobMetadata'], fromTuningJobMetadata);
+    }
     return toObject;
 }
 function tuningOperationFromMldev(fromObject, _rootObject) {
@@ -65376,31 +66260,40 @@ const LANGUAGE_LABEL_PREFIX = 'gl-node/';
  *
  */
 class GoogleGenAI {
-    get interactions() {
+    getNextGenClient() {
         var _a;
-        if (this._interactions !== undefined) {
-            return this._interactions;
-        }
-        console.warn('GoogleGenAI.interactions: Interactions usage is experimental and may change in future versions.');
-        if (this.vertexai) {
-            throw new Error('This version of the GenAI SDK does not support Vertex AI API for interactions.');
-        }
         const httpOpts = this.httpOptions;
+        if (this._nextGenClient === undefined) {
+            this._nextGenClient = new GeminiNextGenAPIClient({
+                baseURL: this.apiClient.getBaseUrl(),
+                apiKey: this.apiKey,
+                apiVersion: this.apiClient.getApiVersion(),
+                clientAdapter: this.apiClient,
+                defaultHeaders: this.apiClient.getDefaultHeaders(),
+                timeout: httpOpts === null || httpOpts === void 0 ? void 0 : httpOpts.timeout,
+                maxRetries: (_a = httpOpts === null || httpOpts === void 0 ? void 0 : httpOpts.retryOptions) === null || _a === void 0 ? void 0 : _a.attempts,
+            });
+        }
         // Unsupported Options Warnings
         if (httpOpts === null || httpOpts === void 0 ? void 0 : httpOpts.extraBody) {
             console.warn('GoogleGenAI.interactions: Client level httpOptions.extraBody is not supported by the interactions client and will be ignored.');
         }
-        const nextGenClient = new GeminiNextGenAPIClient({
-            baseURL: this.apiClient.getBaseUrl(),
-            apiKey: this.apiKey,
-            apiVersion: this.apiClient.getApiVersion(),
-            clientAdapter: this.apiClient,
-            defaultHeaders: this.apiClient.getDefaultHeaders(),
-            timeout: httpOpts === null || httpOpts === void 0 ? void 0 : httpOpts.timeout,
-            maxRetries: (_a = httpOpts === null || httpOpts === void 0 ? void 0 : httpOpts.retryOptions) === null || _a === void 0 ? void 0 : _a.attempts,
-        });
-        this._interactions = nextGenClient.interactions;
+        return this._nextGenClient;
+    }
+    get interactions() {
+        if (this._interactions !== undefined) {
+            return this._interactions;
+        }
+        console.warn('GoogleGenAI.interactions: Interactions usage is experimental and may change in future versions.');
+        this._interactions = this.getNextGenClient().interactions;
         return this._interactions;
+    }
+    get webhooks() {
+        if (this._webhooks !== undefined) {
+            return this._webhooks;
+        }
+        this._webhooks = this.getNextGenClient().webhooks;
+        return this._webhooks;
     }
     constructor(options) {
         var _a;
