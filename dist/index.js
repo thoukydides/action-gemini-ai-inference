@@ -66808,6 +66808,7 @@ function prepareMessages(messages, variables) {
 // GitHub action
 // Copyright © 2026 Alexander Thoukydides
 // List of models and their characteristics (in descending order of capability)
+// (*-latest models are generally aliases for others explicitly listed)
 var ModelType;
 (function (ModelType) {
     ModelType[ModelType["FlashLite"] = 0] = "FlashLite";
@@ -66815,12 +66816,20 @@ var ModelType;
     ModelType[ModelType["Pro"] = 2] = "Pro";
 })(ModelType || (ModelType = {}));
 const MODELS = [{
+        model: 'gemini-flash-latest',
+        type: ModelType.Flash,
+        thinkingLevel: true
+    }, {
         model: 'gemini-3-flash-preview',
         type: ModelType.Flash,
         thinkingLevel: true
     }, {
         model: 'gemini-2.5-flash',
         type: ModelType.Flash,
+        thinkingLevel: false
+    }, {
+        model: 'gemini-flash-lite-latest',
+        type: ModelType.FlashLite,
         thinkingLevel: false
     }, {
         // Gemini 3.1 Flash Lite allows 500 RPD; all others are 20 RPD
