@@ -5,6 +5,7 @@ import * as core from '@actions/core';
 import { assertIsDefined } from './utils';
 
 // List of models and their characteristics (in descending order of capability)
+// (*-latest models are generally aliases for others explicitly listed)
 export enum ModelType { FlashLite, Flash, Pro };
 export interface ModelDetails {
     model:          string;
@@ -12,12 +13,20 @@ export interface ModelDetails {
     thinkingLevel:  boolean;
 }
 const MODELS: ModelDetails[] = [{
+    model:          'gemini-flash-latest',
+    type:           ModelType.Flash,
+    thinkingLevel:  true
+}, {
     model:          'gemini-3-flash-preview',
     type:           ModelType.Flash,
     thinkingLevel:  true
 }, {
     model:          'gemini-2.5-flash',
     type:           ModelType.Flash,
+    thinkingLevel:  false
+}, {
+    model:          'gemini-flash-lite-latest',
+    type:           ModelType.FlashLite,
     thinkingLevel:  false
 }, {
     // Gemini 3.1 Flash Lite allows 500 RPD; all others are 20 RPD
