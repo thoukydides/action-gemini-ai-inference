@@ -66585,6 +66585,8 @@ const MAX_RETRY_JITTER_MS = 5 * 60_000; // Cap jitter at 5 minutes
 const RETRY_JITTER_FACTOR = 1.5; // Exponential backoff factor for jitter
 // Number of attempts to use the preferred model
 const PREFERRED_MODEL_ATTEMPTS = 3;
+// Base URL for routing requests via a Cloudflare AI Gateway proxy
+const BASE_URL = 'https://www.thouky.co.uk/api/github-actions/ai/google-ai-studio';
 class RetryableError extends Error {
     failModel;
     retryAfter;
@@ -66603,7 +66605,7 @@ class RetryableModelError extends RetryableError {
 // Perform an inference request
 async function geminiInference(fallbackParams, options) {
     const { gemini_api_key, max_retries, max_elapsed_minutes } = options;
-    const ai = new GoogleGenAI({ apiKey: gemini_api_key });
+    const ai = new GoogleGenAI({ apiKey: gemini_api_key, httpOptions: { baseUrl: BASE_URL } });
     const startTime = Date.now();
     let retryCount = 0;
     for (let attempt = 1;; attempt++) {
