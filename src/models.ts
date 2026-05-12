@@ -11,6 +11,7 @@ export interface ModelDetails {
     model:          string;
     type:           ModelType;
     thinkingLevel:  boolean;
+    eol?:           string;
 }
 const MODELS: ModelDetails[] = [{
     model:          'gemini-flash-latest',
@@ -20,24 +21,29 @@ const MODELS: ModelDetails[] = [{
     model:          'gemini-3-flash-preview',
     type:           ModelType.Flash,
     thinkingLevel:  true
+    // eol:         Not announced
 }, {
     model:          'gemini-2.5-flash',
     type:           ModelType.Flash,
-    thinkingLevel:  false
-}, {
-    model:          'gemini-flash-lite-latest',
-    type:           ModelType.FlashLite,
-    thinkingLevel:  false
+    thinkingLevel:  false,
+    eol:            '2026-10-16'
 }, {
     // Gemini 3.1 Flash Lite allows 500 RPD; all others are 20 RPD
-    model:          'gemini-3.1-flash-lite-preview',
+    model:          'gemini-flash-lite-latest',
     type:           ModelType.FlashLite,
     thinkingLevel:  true
 }, {
+    // Gemini 3.1 Flash Lite allows 500 RPD; all others are 20 RPD
+    model:          'gemini-3.1-flash-lite',
+    type:           ModelType.FlashLite,
+    thinkingLevel:  true,
+    eol:            '2027-05-07'
+}, {
     model:          'gemini-2.5-flash-lite',
     type:           ModelType.FlashLite,
-    thinkingLevel:  false
-}];
+    thinkingLevel:  false,
+    eol:            '2026-10-16'
+}].filter(m => !m.eol || new Date() < new Date(m.eol));
 
 // Get the preferred and any fallback models
 export function getModels(fallback: boolean, fallback_lite: boolean, preferred?: string): ModelDetails[] {
